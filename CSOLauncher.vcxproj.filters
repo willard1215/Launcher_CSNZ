@@ -51,6 +51,9 @@
     <ClCompile Include="XZip.cpp">
       <Filter>Файлы ресурсов</Filter>
     </ClCompile>
+    <ClCompile Include="..\CSNZ_Server\src\thirdparty\SQLiteCpp\sqlite3\sqlite3.c">
+      <Filter>Файлы ресурсов</Filter>
+    </ClCompile>
   </ItemGroup>
   <ItemGroup>
     <ClInclude Include="hook.h">

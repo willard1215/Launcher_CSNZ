@@ -16,6 +16,8 @@
 #include <string>
 #include <unordered_map>
 #include "sys.h"
+#include <stdarg.h>
+#include "../CSNZ_Server/src/thirdparty/SQLiteCpp/sqlite3/sqlite3.h"
 
 HMODULE g_hEngineModule;
 DWORD g_dwEngineBase;
@@ -32,6 +34,18 @@ DWORD g_dwFileSystemSize;
 
 #define DEFAULT_IP "127.0.0.1"
 #define DEFAULT_PORT "30002"
+#define ENABLE_LAUNCHER_CHAT_AUTOLOGIN 0
+#define ENABLE_GAMEUI_AUTH_UI 0
+
+#define HW_LOGIN_DLG_CTOR_RVA 0x94D800
+#define HW_LOGIN_DLG_ONCOMMAND_RVA 0x94EBA0
+#define HW_AUTH_MANAGER_AUTH_RVA 0x8170A0
+#define HW_AUTH_STATE_GLOBAL_RVA 0x2289984
+#define HW_SOCKET_MANAGER_EVENT_RVA 0xA76AF0
+#define HW_SOCKET_MANAGER_CONNECT_RVA 0xA76F00
+#define HW_READPACKET_EVENT_CALL_RVA 0xA77290
+#define HW_WSARECV_WRAPPER_RVA 0x3AD960
+#define HW_ALLOC_STRING_RVA 0xA709D0
 
 #define SOCKETMANAGER_SIG_CSNZ23 "\x55\x8B\xEC\x6A\x00\x68\x00\x00\x00\x00\x64\xA1\x00\x00\x00\x00\x50\x51\x53\x56\x57\xA1\x00\x00\x00\x00\x33\xC5\x50\x8D\x45\x00\x64\xA3\x00\x00\x00\x00\x8B\xD9\x89\x5D\x00\x8A\x45"
 #define SOCKETMANAGER_MASK_CSNZ23 "xxxx?x????xx????xxxxxx????xxxxx?xx????xxxx?xx"
@@ -89,6 +103,8 @@ DWORD g_dwFileSystemSize;
 
 #define LOADJSON_SIG_CSNZ "\x55\x8B\xEC\x8B\x0D\x00\x00\x00\x00\x53\x56\x8B\x75\x00\x8B\x01\x57\x8B\x50\x00\x8B\x45\x00\x83\x78\x00\x00\x76\x00\x8B\x00\x6A\x00\x68\x00\x00\x00\x00\x50\xFF\xD2\x8B\x0D\x00\x00\x00\x00\x8B\xD8\x53\x8B\x11\xFF\x52\x00\x8B\xF8\x85\xFF\x74"
 #define LOADJSON_MASK_CSNZ "xxxxx????xxxx?xxxxx?xx?xx??x?xxx?x????xxxxx????xxxxxxx?xxxxx"
+#define LOADJSON_SIG_CSNZ_LATEST "\x55\x8B\xEC\x8B\x0D\x00\x00\x00\x00\x53\x56\x8B\x75\x00\x8B\x01\x57\x8B\x50\x30\x8B\x45\x00\x83\x78\x14\x0F\x76\x00\x8B\x00\x6A\x00\x68\x00\x00\x00\x00\x50\xFF\xD2\x8B\x0D\x00\x00\x00\x00\x8B\xD8\x53\x8B\x11\xFF\x52\x44\x8B\xF8\x85\xFF\x0F\x84"
+#define LOADJSON_MASK_CSNZ_LATEST "xxxxx????xxxx?xxxxxxxx?xxxxx?xxxxx????xxxxx????xxxxxxxxxxxxxx"
 
 #define LOGTOERRORLOG_SIG_CSNZ "\x55\x8B\xEC\x81\xEC\x00\x00\x00\x00\xA1\x00\x00\x00\x00\x33\xC5\x89\x45\x00\x56\x57\x8B\x7D\x00\x8D\x45\x00\x50\x6A"
 #define LOGTOERRORLOG_MASK_CSNZ "xxxxx????x????xxxx?xxxx?xx?xx"
@@ -101,6 +117,8 @@ DWORD g_dwFileSystemSize;
 
 #define SOCKETCONSTRUCTOR_SIG_CSNZ "\xE8\x00\x00\x00\x00\xEB\x00\x33\xC0\x53\xC7\x45"
 #define SOCKETCONSTRUCTOR_MASK_CSNZ "x????x?xxxxx"
+#define SOCKETCONSTRUCTOR_SIG_CSNZ_LATEST "\xE8\x00\x00\x00\x00\xEB\x00\x33\xC0\xFF\x75\x0C\xC7\x45"
+#define SOCKETCONSTRUCTOR_MASK_CSNZ_LATEST "x????x?xxxxxxx"
 
 #define EVP_CIPHER_CTX_NEW_SIG_CSNZ "\xE8\x00\x00\x00\x00\x8B\xF8\x89\xBE"
 #define EVP_CIPHER_CTX_NEW_MASK_CSNZ "x????xxxx"
@@ -120,11 +138,16 @@ bool g_bDumpItem = false;
 bool g_bDumpCrypt = false;
 bool g_bDumpAll = false;
 bool g_bDisableAuthUI = false;
-bool g_bUseSSL = false;
+bool g_bUseSSL = true;
 bool g_bWriteMetadata = false;
 bool g_bLoadDediCsvFromFile = false;
 bool g_bRegister = false;
 bool g_bNoNGHook = false;
+bool g_bLoginCommandSent = false;
+bool g_bDisableLocalAuthCheck = false;
+volatile LONG g_lAutoLoginAttempted = 0;
+void* g_pLatestHWSocketManager = nullptr;
+volatile LONG g_lManualReadPumpStarted = 0;
 
 cl_enginefunc_t* g_pEngine;
 
@@ -144,19 +167,97 @@ ChattingManager* g_pChattingManager;
 WNDPROC oWndProc;
 HWND hWnd;
 
-int(__thiscall* g_pfnGameUI_RunFrame)(void* _this);
+void(__thiscall* g_pfnGameUI_RunFrame)(void* _this);
 
 typedef void* (__thiscall* tPanel_FindChildByName)(void* _this, const char* name, bool recurseDown);
 tPanel_FindChildByName g_pfnPanel_FindChildByName;
 
 typedef int(__thiscall* tLoginDlg_OnCommand)(void* _this, const char* command);
 tLoginDlg_OnCommand g_pfnLoginDlg_OnCommand;
+bool g_bLatestLoginCommandHooked = false;
+void* g_pHWLoginDlg = nullptr;
+extern void(__thiscall* g_pfnHWLoginDlg_OnCommand)(void* ptr, const char* command);
 
 typedef void(__thiscall* tParseCSV)(int* _this, unsigned char* buffer, int size);
 tParseCSV g_pfnParseCSV;
 
 typedef void*(*tEVP_CIPHER_CTX_new)();
 tEVP_CIPHER_CTX_new g_pfnEVP_CIPHER_CTX_new;
+
+void LauncherTrace(const char* fmt, ...)
+{
+	FILE* file = fopen("LauncherTrace.log", "a");
+	if (!file)
+		return;
+
+	SYSTEMTIME st;
+	GetLocalTime(&st);
+	fprintf(file, "[%02d:%02d:%02d.%03d] ", st.wHour, st.wMinute, st.wSecond, st.wMilliseconds);
+
+	va_list va;
+	va_start(va, fmt);
+	vfprintf(file, fmt, va);
+	va_end(va);
+
+	fprintf(file, "\n");
+	fclose(file);
+}
+
+void DumpVGuiPanelTree(vgui::IPanel* panel, const char* label, int depth = 0, int maxDepth = 4)
+{
+	if (!g_pPanel || !panel || depth > maxDepth)
+		return;
+
+	__try
+	{
+		int x = 0, y = 0, w = 0, h = 0;
+		g_pPanel->GetPos(panel, x, y);
+		g_pPanel->GetSize(panel, w, h);
+
+		const char* name = g_pPanel->GetName(panel);
+		const char* className = g_pPanel->GetClassName(panel);
+		int childCount = g_pPanel->GetChildCount(panel);
+		LauncherTrace("PanelTree[%s] depth=%d panel=%p name='%s' class='%s' pos=%d,%d size=%dx%d visible=%d enabled=%d children=%d",
+			label, depth, panel, name ? name : "", className ? className : "", x, y, w, h,
+			g_pPanel->IsVisible(panel) ? 1 : 0, g_pPanel->IsEnabled(panel) ? 1 : 0, childCount);
+
+		for (int i = 0; i < childCount && i < 80; i++)
+		{
+			vgui::IPanel* child = g_pPanel->GetChild(panel, i);
+			DumpVGuiPanelTree(child, label, depth + 1, maxDepth);
+		}
+	}
+	__except (EXCEPTION_EXECUTE_HANDLER)
+	{
+		LauncherTrace("PanelTree[%s] exception depth=%d panel=%p", label, depth, panel);
+	}
+}
+
+void DumpClientPanelTree(void* clientPanel, const char* label)
+{
+	if (!clientPanel)
+		return;
+
+	__try
+	{
+		vgui::IPanel* vguiPanel = (vgui::IPanel*)(**(void* (__thiscall***)(void*))clientPanel)(clientPanel);
+		LauncherTrace("PanelTree[%s] client=%p vgui=%p", label, clientPanel, vguiPanel);
+		DumpVGuiPanelTree(vguiPanel, label);
+	}
+	__except (EXCEPTION_EXECUTE_HANDLER)
+	{
+		LauncherTrace("PanelTree[%s] client exception client=%p", label, clientPanel);
+	}
+}
+
+DWORD FindPatternCompat(PCHAR pattern, PCHAR mask, PCHAR fallbackPattern, PCHAR fallbackMask, DWORD start, DWORD end)
+{
+	DWORD find = FindPattern(pattern, mask, start, end, NULL);
+	if (!find && fallbackPattern && fallbackMask)
+		find = FindPattern(fallbackPattern, fallbackMask, start, end, NULL);
+
+	return find;
+}
 
 #pragma region Nexon NGClient/NXGSM
 char NGClient_Return1()
@@ -188,6 +289,106 @@ void Pbuf_AddText(const char* text)
 	g_pEngine->pfnClientCmd((char*)text);
 }
 
+void SendLoginCommand()
+{
+	if (g_bLoginCommandSent || !g_pChattingManager)
+		return;
+
+	const char* login = strlen(g_pLogin) ? g_pLogin : "localuser";
+	const char* password = strlen(g_pPassword) ? g_pPassword : "localpass1";
+
+	wchar_t buf[256];
+	swprintf(buf, g_bRegister ? L"/register %S %S" : L"/login %S %S", login, password);
+	g_pChattingManager->PrintToChat(1, buf);
+	g_bLoginCommandSent = true;
+	LauncherTrace("SendLoginCommand: sent %S", buf);
+}
+
+static bool FileExistsA(const std::string& path)
+{
+	DWORD attr = GetFileAttributesA(path.c_str());
+	return attr != INVALID_FILE_ATTRIBUTES && !(attr & FILE_ATTRIBUTE_DIRECTORY);
+}
+
+static std::vector<std::string> GetLocalUserDatabaseCandidates()
+{
+	std::vector<std::string> candidates;
+
+	char modulePath[MAX_PATH] = { 0 };
+	GetModuleFileNameA(NULL, modulePath, sizeof(modulePath));
+
+	std::string dir = modulePath;
+	size_t slash = dir.find_last_of("\\/");
+	if (slash != std::string::npos)
+		dir.resize(slash);
+
+	candidates.push_back(dir + "\\UserDatabase.db3");
+
+	const std::string assetBinSuffix = "\\asset\\Bin";
+	if (dir.size() >= assetBinSuffix.size() &&
+		_stricmp(dir.c_str() + dir.size() - assetBinSuffix.size(), assetBinSuffix.c_str()) == 0)
+	{
+		std::string root = dir.substr(0, dir.size() - assetBinSuffix.size());
+		candidates.push_back(root + "\\CSNZ_Server\\bin\\UserDatabase.db3");
+	}
+
+	candidates.push_back("..\\..\\CSNZ_Server\\bin\\UserDatabase.db3");
+	candidates.push_back("..\\CSNZ_Server\\bin\\UserDatabase.db3");
+	candidates.push_back("CSNZ_Server\\bin\\UserDatabase.db3");
+
+	return candidates;
+}
+
+static bool ValidateLocalUserAccount(const char* login, const char* password)
+{
+	if (!login || !password || !login[0] || !password[0])
+	{
+		LauncherTrace("ValidateLocalUserAccount: empty login/password");
+		return false;
+	}
+
+	for (const std::string& dbPath : GetLocalUserDatabaseCandidates())
+	{
+		if (!FileExistsA(dbPath))
+			continue;
+
+		sqlite3* db = nullptr;
+		int rc = sqlite3_open_v2(dbPath.c_str(), &db, SQLITE_OPEN_READONLY, nullptr);
+		if (rc != SQLITE_OK)
+		{
+			LauncherTrace("ValidateLocalUserAccount: sqlite open failed path='%s' rc=%d msg='%s'",
+				dbPath.c_str(), rc, db ? sqlite3_errmsg(db) : "");
+			if (db)
+				sqlite3_close(db);
+			continue;
+		}
+
+		sqlite3_stmt* stmt = nullptr;
+		const char* sql = "SELECT userID FROM User WHERE userName = ? AND password = ? LIMIT 1";
+		rc = sqlite3_prepare_v2(db, sql, -1, &stmt, nullptr);
+		if (rc != SQLITE_OK)
+		{
+			LauncherTrace("ValidateLocalUserAccount: sqlite prepare failed path='%s' rc=%d msg='%s'",
+				dbPath.c_str(), rc, sqlite3_errmsg(db));
+			sqlite3_close(db);
+			continue;
+		}
+
+		sqlite3_bind_text(stmt, 1, login, -1, SQLITE_TRANSIENT);
+		sqlite3_bind_text(stmt, 2, password, -1, SQLITE_TRANSIENT);
+		rc = sqlite3_step(stmt);
+		bool ok = rc == SQLITE_ROW;
+		sqlite3_finalize(stmt);
+		sqlite3_close(db);
+
+		LauncherTrace("ValidateLocalUserAccount: path='%s' login='%s' result=%d", dbPath.c_str(), login, ok ? 1 : 0);
+		return ok;
+	}
+
+	LauncherTrace("ValidateLocalUserAccount: UserDatabase.db3 not found");
+	return false;
+}
+
 CreateHookClass(void*, SocketManagerConstructor, bool useSSL)
 {
 	return g_pfnSocketManagerConstructor(ptr, g_bUseSSL);
@@ -195,7 +396,203 @@ CreateHookClass(void*, SocketManagerConstructor, bool useSSL)
 
 CreateHookClass(int, ServerConnect, unsigned long ip, unsigned short port, bool validate)
 {
+	in_addr originalAddr;
+	originalAddr.s_addr = ip;
+	LauncherTrace("ServerConnect original=%s:%d override=%s:%s validate=%d",
+		inet_ntoa(originalAddr), ntohs(port), g_pServerIP, g_pServerPort, validate ? 1 : 0);
 	return g_pfnServerConnect(ptr, inet_addr(g_pServerIP), htons(atoi(g_pServerPort)), validate);
+}
+
+static void DumpHWSocketManagerHandlers(void* manager)
+{
+	if (!manager || !g_dwEngineBase)
+		return;
+
+	int count = 0;
+	for (int id = 0; id < 256; id++)
+	{
+		DWORD handler = 0;
+		DWORD vtbl = 0;
+		DWORD parseFn = 0;
+
+		__try
+		{
+			handler = *(DWORD*)((DWORD)manager + 0x10 + id * 4);
+			if (handler)
+			{
+				vtbl = *(DWORD*)handler;
+				parseFn = *(DWORD*)(vtbl + 8);
+			}
+		}
+		__except (EXCEPTION_EXECUTE_HANDLER)
+		{
+			handler = 0;
+			vtbl = 0;
+			parseFn = 0;
+		}
+
+		if (handler)
+		{
+			count++;
+			LauncherTrace("HandlerTable id=%d handler=%08X vtbl=%08X parse=%08X rva=%08X",
+				id, handler, vtbl, parseFn, parseFn ? parseFn - g_dwEngineBase : 0);
+		}
+	}
+
+	LauncherTrace("HandlerTable total=%d manager=%p", count, manager);
+}
+
+CreateHookClass(int, HWSocketManager_Event, unsigned int eventCode)
+{
+	DWORD socketPtr = 0;
+	DWORD handlerTable = 0;
+	BYTE socketPacketSeq = 0;
+	WORD networkEvent = LOWORD(eventCode);
+	WORD networkError = HIWORD(eventCode);
+
+	__try
+	{
+		socketPtr = *(DWORD*)((DWORD)ptr + 0x4);
+		if (socketPtr)
+		{
+			handlerTable = *(DWORD*)((DWORD)ptr + 0x10);
+			socketPacketSeq = *(BYTE*)(socketPtr + 0x39);
+		}
+	}
+	__except (EXCEPTION_EXECUTE_HANDLER)
+	{
+		LauncherTrace("HWSocketManager::Event state read exception this=%p event=%08X", ptr, eventCode);
+	}
+
+	if (networkEvent == FD_READ || networkEvent == FD_WRITE || networkEvent == FD_CONNECT || networkEvent == FD_CLOSE)
+		LauncherTrace("HWSocketManager::Event enter this=%p event=%08X eventLow=%u error=%u socket=%08X handlers=%08X seq=%u",
+			ptr, eventCode, networkEvent, networkError, socketPtr, handlerTable, socketPacketSeq);
+
+	int result = g_pfnHWSocketManager_Event(ptr, eventCode);
+
+	if (networkEvent == FD_READ || networkEvent == FD_WRITE || networkEvent == FD_CONNECT || networkEvent == FD_CLOSE)
+	{
+		DWORD socketAfter = 0;
+		__try
+		{
+			socketAfter = *(DWORD*)((DWORD)ptr + 0x4);
+		}
+		__except (EXCEPTION_EXECUTE_HANDLER)
+		{
+		}
+		LauncherTrace("HWSocketManager::Event leave this=%p event=%08X eventLow=%u error=%u result=%d socketAfter=%08X",
+			ptr, eventCode, networkEvent, networkError, result, socketAfter);
+	}
+
+	return result;
+}
+
+CreateHookClass(int, HWSocketManager_Connect, unsigned long ip, unsigned short port, bool initialRead)
+{
+	in_addr addr;
+	addr.s_addr = ip;
+	LauncherTrace("HWSocketManager::Connect enter this=%p target=%s:%u initialRead=%d",
+		ptr, inet_ntoa(addr), ntohs(port), initialRead ? 1 : 0);
+
+	int result = g_pfnHWSocketManager_Connect(ptr, ip, port, initialRead);
+
+	DWORD socketPtr = 0;
+	__try
+	{
+		socketPtr = *(DWORD*)((DWORD)ptr + 0x4);
+	}
+	__except (EXCEPTION_EXECUTE_HANDLER)
+	{
+	}
+
+	LauncherTrace("HWSocketManager::Connect leave this=%p result=%d socket=%08X", ptr, result, socketPtr);
+	if (!g_bUseOriginalServer && result && socketPtr)
+	{
+		g_pLatestHWSocketManager = ptr;
+		DumpHWSocketManagerHandlers(ptr);
+		if (InterlockedCompareExchange(&g_lManualReadPumpStarted, 1, 0) == 0)
+		{
+			CreateThread(NULL, 0, [](LPVOID) -> DWORD
+			{
+				Sleep(2500);
+				for (int i = 0; i < 120; i++)
+				{
+					void* manager = g_pLatestHWSocketManager;
+					if (!manager || !g_pfnHWSocketManager_Event)
+						break;
+
+					__try
+					{
+						LauncherTrace("Manual FD_READ pump tick=%d manager=%p", i, manager);
+						g_pfnHWSocketManager_Event(manager, FD_READ);
+					}
+					__except (EXCEPTION_EXECUTE_HANDLER)
+					{
+						LauncherTrace("Manual FD_READ pump exception tick=%d manager=%p", i, manager);
+						break;
+					}
+
+					Sleep(250);
+				}
+				InterlockedExchange(&g_lManualReadPumpStarted, 0);
+				return 0;
+			}, NULL, 0, NULL);
+		}
+	}
+	return result;
+}
+
+CreateHookClassType(int, HWSocket_WSARecv, void, DWORD* socketHandlePtr, DWORD* buffers, DWORD bufferCount, DWORD flagsIn, bool skipRecv, void* overlapped)
+{
+	SOCKET socketHandle = INVALID_SOCKET;
+	DWORD firstLen = 0;
+	char* firstBuf = nullptr;
+
+	__try
+	{
+		if (socketHandlePtr)
+			socketHandle = (SOCKET)*socketHandlePtr;
+		if (buffers && bufferCount > 0)
+		{
+			firstLen = buffers[0];
+			firstBuf = (char*)buffers[1];
+		}
+	}
+	__except (EXCEPTION_EXECUTE_HANDLER)
+	{
+		LauncherTrace("HWSocket::WSARecv wrapper state read exception this=%p socketPtr=%p", ptr, socketHandlePtr);
+	}
+
+	LauncherTrace("HWSocket::WSARecv wrapper enter this=%p socket=%u buffers=%u firstLen=%u flags=%u skip=%d ov=%p",
+		ptr, (unsigned int)socketHandle, bufferCount, firstLen, flagsIn, skipRecv ? 1 : 0, overlapped);
+
+	int result = g_pfnHWSocket_WSARecv(ptr, socketHandlePtr, buffers, bufferCount, flagsIn, skipRecv, overlapped);
+
+	DWORD bytesHint = 0;
+	unsigned char b0 = 0xFF;
+	unsigned char b1 = 0xFF;
+	unsigned char b2 = 0xFF;
+	unsigned char b3 = 0xFF;
+	__try
+	{
+		if (buffers && bufferCount > 0)
+			bytesHint = buffers[0];
+		if (firstBuf && firstLen >= 4)
+		{
+			b0 = (unsigned char)firstBuf[0];
+			b1 = (unsigned char)firstBuf[1];
+			b2 = (unsigned char)firstBuf[2];
+			b3 = (unsigned char)firstBuf[3];
+		}
+	}
+	__except (EXCEPTION_EXECUTE_HANDLER)
+	{
+		LauncherTrace("HWSocket::WSARecv wrapper result read exception this=%p", ptr);
+	}
+
+	LauncherTrace("HWSocket::WSARecv wrapper leave this=%p result=%d firstLenNow=%u firstBytes=%02X %02X %02X %02X",
+		ptr, result, bytesHint, b0, b1, b2, b3);
+	return result;
 }
 
 CreateHook(__cdecl, void, HolePunch_SetServerInfo, unsigned long ip, unsigned short port)
@@ -547,18 +944,15 @@ metaDataType GetMetadataType(int metaDataID)
 	case 0:
 	case 1:
 	case 2:
-	case 9:
-	case 17:
-	case 18:
-	case 24:
-	case 25:
-	case 26:
+	case 12:
+	case 20:
+	case 21:
 	case 27:
 	case 28:
 	case 29:
+	case 30:
+	case 31:
 	case 32:
-	case 33:
-	case 34:
 	case 35:
 	case 36:
 	case 37:
@@ -567,14 +961,24 @@ metaDataType GetMetadataType(int metaDataID)
 	case 40:
 	case 41:
 	case 42:
+	case 43:
 	case 44:
 	case 45:
-	case 46:
+	case 47:
 	case 48:
-	case 50:
 	case 51:
-	case 52:
 	case 53:
+	case 54:
+	case 55:
+	case 56:
+	case 59:
+	case 61:
+	case 62:
+	case 63:
+	case 64:
+	case 65:
+	case 66:
+	case 69:
 		return zipMetadata;
 	case 6:
 	case 15:
@@ -590,75 +994,83 @@ const char* GetMetadataName(int metaDataID)
 	switch (metaDataID)
 	{
 	case 0:
-		return "MapList.csv";
+		return "resource/MapList.csv";
 	case 1:
-		return "ClientTable.csv";
+		return "resource/itemBox.csv";
 	case 2:
-		return "ModeList.csv";
-	case 6:
-		return "WeaponPaints";
-	case 9:
-		return "MatchOption.csv";
-	case 15:
-		return "ZombieWarWeaponList";
-	case 16:
-		return "RandomWeaponList";
-	case 17:
+		return "resource/MapModeV2/ModeList.csv";
+	case 12:
+		return "Matching.csv";
+	case 20:
 		return "weaponparts.csv";
-	case 18:
+	case 21:
 		return "MileageShop.csv";
-	case 24:
-		return "GameModeList.csv";
-	case 25:
-		return "badwordadd.csv";
-	case 26:
-		return "badworddel.csv";
 	case 27:
-		return "progress_unlock.csv";
+		return "resource/GameModeList.csv";
 	case 28:
-		return "ReinforceMaxLv.csv";
+		return "badwordadd.csv";
 	case 29:
-		return "ReinforceMaxExp.csv";
+		return "badworddel.csv";
 	case 30:
-		return "ReinforceItemsExp";
+		return "resource/zombiez/progress_unlock.csv";
+	case 31:
+		return "ReinforceMaxLv.csv";
 	case 32:
-		return "Item.csv";
-	case 33:
-		return "voxel_list.csv";
-	case 34:
-		return "voxel_item.csv";
+		return "ReinforceMaxExp.csv";
 	case 35:
-		return "CodisData.csv";
+		return "resource/item.csv";
 	case 36:
-		return "HonorMoneyShop.csv";
+		return "voxel/voxel_list.csv";
 	case 37:
-		return "ItemExpireTime.csv";
+		return "voxel/voxel_item.csv";
 	case 38:
-		return "scenariotx_common.json";
+		return "resource/codis/codisdata.cso";
 	case 39:
-		return "scenariotx_dedi.json";
+		return "HonorShop.csv";
 	case 40:
-		return "shopitemlist_dedi.json";
+		return "resource/ItemExpireTime.csv";
 	case 41:
-		return "EpicPieceShop.csv";
+		return "resource/scenariotx/scenariotx_common.json";
 	case 42:
-		return "WeaponProp.json";
+		return "resource/scenariotx/scenariotx_dedi.json";
+	case 43:
+		return "resource/scenariotx/shopitemlist_dedi.json";
 	case 44:
-		return "SeasonBadgeShop.csv";
+		return "EpicPieceShop.csv";
 	case 45:
-		return "ppsystem.json";
-	case 46:
-		return "classmastery.json";
+		return "models/SkinWeaponInfo_server.json";
+	case 47:
+		return "SeasonBadgeShop.csv";
 	case 48:
-		return "ZBCompetitive.json"; // required or game will crash
-	case 50:
-		return "ModeEvent.csv";
+		return "ppsystem/config.json";
+	case 49:
+		return "resource/buff/classmastery.json";
 	case 51:
-		return "EventShop.csv";
-	case 52:
-		return "FamilyTotalWarMap.csv";
+		return "resource/zombiecompetitive/ZBCompetitive.json";
 	case 53:
-		return "FamilyTotalWar.json";
+		return "resource/ModeEvent/ModeEvent.csv";
+	case 54:
+		return "resource/CPShop/EventShop.csv";
+	case 55:
+		return "resource/ClanWar/FamilyTotalWarMap.csv";
+	case 56:
+		return "resource/ClanWar/FamilyTotalWar.json";
+	case 59:
+		return "resource/WeaponAscend.csv";
+	case 61:
+		return "resource/zombi/PerkParam.csv";
+	case 62:
+		return "AnniversaryShop.csv";
+	case 63:
+		return "resource/Anniversary/GlobalAnniversary.json";
+	case 64:
+		return "resource/Anniversary/AnniversaryLottery.json";
+	case 65:
+		return "resource/Anniversary/AnniversaryTicket.json";
+	case 66:
+		return "resource/Synthesis/SynthesisItem.csv";
+	case 69:
+		return "ZCoinShop.csv";
 	}
 	return NULL;
 }
@@ -676,6 +1088,7 @@ CreateHookClass(int, Packet_Metadata_Parse, void* packetBuffer, int packetSize)
 	}
 
 	unsigned char metaDataID = *(unsigned char*)packetBuffer;
+	LauncherTrace("Packet_Metadata_Parse this=%p size=%d metadataID=%u", ptr, packetSize, metaDataID);
 	printf("Received metadata ID %d\n", metaDataID);
 
 	metaDataType metaDataType = GetMetadataType(metaDataID);
@@ -952,30 +1365,35 @@ void DumpPacket(const char* packetName, void* packetBuffer, int packetSize)
 
 CreateHookClass(int, Packet_Quest_Parse, void* packetBuffer, int packetSize)
 {
+	LauncherTrace("Packet_Quest_Parse this=%p size=%d subtype=%u", ptr, packetSize, packetSize > 0 ? *(unsigned char*)packetBuffer : 0xFF);
 	DumpPacket("QuestDump", packetBuffer, packetSize);
 	return g_pfnPacket_Quest_Parse(ptr, packetBuffer, packetSize);
 }
 
 CreateHookClass(int, Packet_UMsg_Parse, void* packetBuffer, int packetSize)
 {
+	LauncherTrace("Packet_UMsg_Parse this=%p size=%d subtype=%u", ptr, packetSize, packetSize > 0 ? *(unsigned char*)packetBuffer : 0xFF);
 	DumpPacket("UMsgDump", packetBuffer, packetSize);
 	return g_pfnPacket_UMsg_Parse(ptr, packetBuffer, packetSize);
 }
 
 CreateHookClass(int, Packet_Alarm_Parse, void* packetBuffer, int packetSize)
 {
+	LauncherTrace("Packet_Alarm_Parse this=%p size=%d subtype=%u", ptr, packetSize, packetSize > 0 ? *(unsigned char*)packetBuffer : 0xFF);
 	DumpPacket("AlarmDump", packetBuffer, packetSize);
 	return g_pfnPacket_Alarm_Parse(ptr, packetBuffer, packetSize);
 }
 
 CreateHookClass(int, Packet_Item_Parse, void* packetBuffer, int packetSize)
 {
+	LauncherTrace("Packet_Item_Parse this=%p size=%d subtype=%u", ptr, packetSize, packetSize > 0 ? *(unsigned char*)packetBuffer : 0xFF);
 	DumpPacket("ItemDump", packetBuffer, packetSize);
 	return g_pfnPacket_Item_Parse(ptr, packetBuffer, packetSize);
 }
 
 CreateHookClass(int, Packet_Crypt_Parse, void* packetBuffer, int packetSize)
 {
+	LauncherTrace("Packet_Crypt_Parse this=%p size=%d subtype=%u", ptr, packetSize, packetSize > 0 ? *(unsigned char*)packetBuffer : 0xFF);
 	DumpPacket("CryptDump", packetBuffer, packetSize);
 	return g_pfnPacket_Crypt_Parse(ptr, packetBuffer, packetSize);
 }
@@ -1024,39 +1442,318 @@ void __fastcall LoginDlg_OnCommand(void* _this, int r, const char* command)
 	g_pfnLoginDlg_OnCommand(_this, command);
 }
 
+CreateHookClass(void, LoginDlg_OnCommand_Latest, const char* command)
+{
+	if (!strcmp(command, "Login"))
+	{
+		char login[256] = { 0 };
+		char password[256] = { 0 };
+
+		void* pLoginTextEntry = *(void**)((DWORD)ptr + 0x1BC);
+		void* pPasswordTextEntry = *(void**)((DWORD)ptr + 0x1C0);
+		LauncherTrace("LoginDlg_OnCommand_Latest Login: loginEntry=%p passwordEntry=%p chat=%p",
+			pLoginTextEntry, pPasswordTextEntry, g_pChattingManager);
+
+		if (pLoginTextEntry)
+			(*(void(__thiscall**)(void*, char*, signed int))(*(DWORD*)pLoginTextEntry + 0x290))(pLoginTextEntry, login, 256);
+		if (pPasswordTextEntry)
+			(*(void(__thiscall**)(void*, char*, signed int))(*(DWORD*)pPasswordTextEntry + 0x290))(pPasswordTextEntry, password, 256);
+
+		wchar_t buf[256];
+		swprintf(buf, L"/login %S %S", login, password);
+		if (g_pChattingManager)
+			g_pChattingManager->PrintToChat(1, buf);
+		return;
+	}
+
+	g_pfnLoginDlg_OnCommand_Latest(ptr, command);
+}
+
+static void ReadHWTextEntry(void* entry, char* out, int outSize)
+{
+	if (!out || outSize <= 0)
+		return;
+
+	out[0] = 0;
+	if (!entry)
+		return;
+
+	__try
+	{
+		(*(void(__thiscall**)(void*, char*, signed int))(*(DWORD*)entry + 0x290))(entry, out, outSize);
+		out[outSize - 1] = 0;
+	}
+	__except (EXCEPTION_EXECUTE_HANDLER)
+	{
+		out[0] = 0;
+		LauncherTrace("ReadHWTextEntry exception entry=%p", entry);
+	}
+}
+
+static bool HasCommandLineLogin()
+{
+	return g_pLogin[0] != 0 && g_pPassword[0] != 0;
+}
+
+static char* CreateHWString(const char* text)
+{
+	if (!text)
+		text = "";
+
+	typedef int* (__cdecl* tHWAllocString)(int len);
+	tHWAllocString allocString = (tHWAllocString)(g_dwEngineBase + HW_ALLOC_STRING_RVA);
+	int len = (int)strlen(text);
+
+	__try
+	{
+		int* storage = allocString(len);
+		if (!storage)
+			return nullptr;
+
+		char* data = (char*)(storage + 3);
+		memcpy(data, text, len);
+		data[len] = 0;
+		*storage = len;
+		return data;
+	}
+	__except (EXCEPTION_EXECUTE_HANDLER)
+	{
+		LauncherTrace("CreateHWString exception textLen=%d", len);
+	}
+
+	return nullptr;
+}
+
+DWORD WINAPI AutoHWLoginThread(LPVOID param)
+{
+	void* loginDlg = param;
+	Sleep(4500);
+
+	if (!loginDlg || !g_pfnHWLoginDlg_OnCommand)
+	{
+		LauncherTrace("AutoHWLogin skipped: dlg=%p onCommand=%p", loginDlg, g_pfnHWLoginDlg_OnCommand);
+		return 0;
+	}
+
+	__try
+	{
+		LauncherTrace("AutoHWLogin invoking Login command: dlg=%p login='%s' passwordLen=%d",
+			loginDlg, g_pLogin, (int)strlen(g_pPassword));
+		g_pfnHWLoginDlg_OnCommand(loginDlg, "Login");
+	}
+	__except (EXCEPTION_EXECUTE_HANDLER)
+	{
+		LauncherTrace("AutoHWLogin exception: dlg=%p", loginDlg);
+	}
+
+	return 0;
+}
+
+CreateHookClass(void*, HWLoginDlgConstructor, void* parent)
+{
+	void* ret = g_pfnHWLoginDlgConstructor(ptr, parent);
+	g_pHWLoginDlg = ret ? ret : ptr;
+
+	__try
+	{
+		LauncherTrace("HWLoginDlg ctor this=%p parent=%p ret=%p idEntry=%p passwordEntry=%p loginBtn=%p saveID=%p",
+			ptr, parent, ret,
+			*(void**)((DWORD)ptr + 0x1B8),
+			*(void**)((DWORD)ptr + 0x1BC),
+			*(void**)((DWORD)ptr + 0x1C4),
+			*(void**)((DWORD)ptr + 0x1DC));
+	}
+	__except (EXCEPTION_EXECUTE_HANDLER)
+	{
+		LauncherTrace("HWLoginDlg ctor log exception this=%p parent=%p ret=%p", ptr, parent, ret);
+	}
+
+	if (HasCommandLineLogin() && InterlockedCompareExchange(&g_lAutoLoginAttempted, 1, 0) == 0)
+	{
+		HANDLE thread = CreateThread(NULL, 0, AutoHWLoginThread, g_pHWLoginDlg, 0, NULL);
+		if (thread)
+		{
+			CloseHandle(thread);
+			LauncherTrace("AutoHWLogin scheduled: dlg=%p", g_pHWLoginDlg);
+		}
+		else
+		{
+			LauncherTrace("AutoHWLogin CreateThread failed: err=%lu", GetLastError());
+		}
+	}
+
+	return ret;
+}
+
+CreateHookClass(void, HWLoginDlg_OnCommand, const char* command)
+{
+	const char* safeCommand = command ? command : "";
+	LauncherTrace("HWLoginDlg OnCommand this=%p command='%s'", ptr, safeCommand);
+
+	if (!strcmp(safeCommand, "Login"))
+	{
+		char login[256] = { 0 };
+		char password[256] = { 0 };
+
+		__try
+		{
+			void* pLoginTextEntry = *(void**)((DWORD)ptr + 0x1B8);
+			void* pPasswordTextEntry = *(void**)((DWORD)ptr + 0x1BC);
+			ReadHWTextEntry(pLoginTextEntry, login, sizeof(login));
+			ReadHWTextEntry(pPasswordTextEntry, password, sizeof(password));
+			LauncherTrace("HWLoginDlg Login: idEntry=%p passwordEntry=%p login='%s' passwordLen=%d",
+				pLoginTextEntry, pPasswordTextEntry, login, (int)strlen(password));
+		}
+		__except (EXCEPTION_EXECUTE_HANDLER)
+		{
+			LauncherTrace("HWLoginDlg Login read exception this=%p", ptr);
+		}
+	}
+
+	g_pfnHWLoginDlg_OnCommand(ptr, command);
+}
+
+CreateHookClass(bool, HWAuthManager_Auth, char* login, char* password, char* extra)
+{
+	char* effectiveLogin = login;
+	char* effectivePassword = password;
+	char* originalLogin = login;
+	char* originalPassword = password;
+	if (HasCommandLineLogin())
+	{
+		effectiveLogin = g_pLogin;
+		effectivePassword = g_pPassword;
+	}
+
+	int authMode = -1;
+	void* authState = nullptr;
+	__try
+	{
+		authState = *(void**)(g_dwEngineBase + HW_AUTH_STATE_GLOBAL_RVA);
+		if (authState)
+			authMode = *(int*)((DWORD)authState + 0x10);
+	}
+	__except (EXCEPTION_EXECUTE_HANDLER)
+	{
+		LauncherTrace("HWAuthManager::Auth state read exception");
+	}
+
+	LauncherTrace("HWAuthManager::Auth enter this=%p mode=%d state=%p login='%s' passwordLen=%d extra=%p cmdlineOverride=%d",
+		ptr, authMode, authState, effectiveLogin ? effectiveLogin : "",
+		effectivePassword ? (int)strlen(effectivePassword) : 0, extra, HasCommandLineLogin() ? 1 : 0);
+
+	if (!g_bUseOriginalServer && !g_bDisableLocalAuthCheck && !ValidateLocalUserAccount(effectiveLogin, effectivePassword))
+	{
+		LauncherTrace("HWAuthManager::Auth denied locally: login='%s'", effectiveLogin ? effectiveLogin : "");
+		MessageBox(NULL, "Wrong password or username.", "Login Failed", MB_OK | MB_ICONWARNING);
+		return false;
+	}
+
+	if (!g_bUseOriginalServer && authState && authMode == 0)
+	{
+		__try
+		{
+			*(int*)((DWORD)authState + 0x10) = 100;
+			LauncherTrace("HWAuthManager::Auth forced local game-server auth mode: 0 -> 100");
+		}
+		__except (EXCEPTION_EXECUTE_HANDLER)
+		{
+			LauncherTrace("HWAuthManager::Auth failed to force local auth mode");
+		}
+	}
+
+	if (HasCommandLineLogin())
+	{
+		char* hwLogin = CreateHWString(g_pLogin);
+		char* hwPassword = CreateHWString(g_pPassword);
+		if (hwLogin && hwPassword)
+		{
+			originalLogin = hwLogin;
+			originalPassword = hwPassword;
+			LauncherTrace("HWAuthManager::Auth using allocated hw strings: login=%p password=%p", hwLogin, hwPassword);
+		}
+		else
+		{
+			LauncherTrace("HWAuthManager::Auth failed to allocate hw strings, using original args: login=%p password=%p",
+				login, password);
+		}
+	}
+
+	bool result = g_pfnHWAuthManager_Auth(ptr, originalLogin, originalPassword, extra);
+
+	int authModeAfter = -1;
+	int flag20 = -1;
+	int flag21 = -1;
+	int flag22 = -1;
+	void* packetState = nullptr;
+	__try
+	{
+		if (authState)
+			authModeAfter = *(int*)((DWORD)authState + 0x10);
+		flag20 = *(BYTE*)((DWORD)ptr + 0x20);
+		flag21 = *(BYTE*)((DWORD)ptr + 0x21);
+		flag22 = *(BYTE*)((DWORD)ptr + 0x22);
+		packetState = *(void**)((DWORD)ptr + 0x2C);
+	}
+	__except (EXCEPTION_EXECUTE_HANDLER)
+	{
+		LauncherTrace("HWAuthManager::Auth state after read exception");
+	}
+
+	LauncherTrace("HWAuthManager::Auth leave this=%p result=%d modeAfter=%d flags20=%d flags21=%d flags22=%d packetState=%p",
+		ptr, result ? 1 : 0, authModeAfter,
+		flag20, flag21, flag22, packetState);
+
+	return result;
+}
+
 bool bShowLoginDlg = false;
-int __fastcall GameUI_RunFrame(void* _this)
+void __fastcall GameUI_RunFrame(void* _this)
 {
 	if (!bShowLoginDlg)
 	{
-		if (strlen(g_pLogin) != 0 || strlen(g_pPassword) != 0)
+		LauncherTrace("GameUI_RunFrame first run: this=%p, disableAuthUI=%d, loginLen=%d, passwordLen=%d, chat=%p",
+			_this, g_bDisableAuthUI ? 1 : 0, (int)strlen(g_pLogin), (int)strlen(g_pPassword), g_pChattingManager);
+
+		if (ENABLE_LAUNCHER_CHAT_AUTOLOGIN && (strlen(g_pLogin) != 0 || strlen(g_pPassword) != 0))
 		{
 			Sleep(500);
 
 			wchar_t buf[256];
 			swprintf(buf, g_bRegister ? L"/register %S %S" : L"/login %S %S", g_pLogin, g_pPassword);
 			if (g_pChattingManager)
+			{
+				LauncherTrace("GameUI_RunFrame sending command via ChattingManager");
 				g_pChattingManager->PrintToChat(1, buf);
+			}
+			else
+				LauncherTrace("GameUI_RunFrame cannot send command: ChattingManager is NULL");
 		}
 
-		if (!g_bDisableAuthUI)
+		if (ENABLE_GAMEUI_AUTH_UI && !g_bDisableAuthUI)
 		{
 			__try
 			{
-				void* pCSOMainPanel = **((void***)(FindPattern(CSOMAINPANEL_PTR_SIG_CSNZ, CSOMAINPANEL_PTR_MASK_CSNZ, g_dwGameUIBase, g_dwGameUIBase + g_dwGameUISize, 2)));
+				DWORD csoMainPanelPattern = FindPattern(CSOMAINPANEL_PTR_SIG_CSNZ, CSOMAINPANEL_PTR_MASK_CSNZ, g_dwGameUIBase, g_dwGameUIBase + g_dwGameUISize, 2);
+				LauncherTrace("GameUI_RunFrame CSOMainPanel pattern=%08X", csoMainPanelPattern);
+				void* pCSOMainPanel = **((void***)(csoMainPanelPattern));
+				LauncherTrace("GameUI_RunFrame CSOMainPanel=%p", pCSOMainPanel);
 				if (!pCSOMainPanel)
 				{
 					MessageBox(NULL, "pCSOMainPanel == NULL!!!\nUse -disableauthui parameter to disable VGUI login dialog", "Error", MB_OK);
 					bShowLoginDlg = true;
-					return g_pfnGameUI_RunFrame(_this);
+					g_pfnGameUI_RunFrame(_this);
+					return;
 				}
 
 				DWORD dwPanel_FindChildByNameRelAddr = FindPattern(CALL_PANEL_FINDCHILDBYNAME_SIG_CSNZ, CALL_PANEL_FINDCHILDBYNAME_MASK_CSNZ, g_dwGameUIBase, g_dwGameUIBase + g_dwGameUISize, 1);
+				LauncherTrace("GameUI_RunFrame Panel_FindChildByName call=%08X", dwPanel_FindChildByNameRelAddr);
 				if (!dwPanel_FindChildByNameRelAddr)
 				{
 					MessageBox(NULL, "dwPanel_FindChildByNameRelAddr == NULL!!!\nUse -disableauthui parameter to disable VGUI login dialog", "Error", MB_OK);
 					bShowLoginDlg = true;
-					return g_pfnGameUI_RunFrame(_this);
+					g_pfnGameUI_RunFrame(_this);
+					return;
 				}
 				
 				g_pfnPanel_FindChildByName = (tPanel_FindChildByName)(dwPanel_FindChildByNameRelAddr + 4 + *(DWORD*)dwPanel_FindChildByNameRelAddr);
@@ -1064,29 +1761,36 @@ int __fastcall GameUI_RunFrame(void* _this)
 				{
 					MessageBox(NULL, "g_pfnPanel_FindChildByName == NULL!!!\nUse -disableauthui parameter to disable VGUI login dialog", "Error", MB_OK);
 					bShowLoginDlg = true;
-					return g_pfnGameUI_RunFrame(_this);
+					g_pfnGameUI_RunFrame(_this);
+					return;
 				}
 
 				void* pLoginDlg = *(void**)((DWORD)pCSOMainPanel + 364);
+				LauncherTrace("GameUI_RunFrame LoginDlg=%p from CSOMainPanel+364", pLoginDlg);
 				if (!pLoginDlg)
 				{
 					MessageBox(NULL, "pLoginDlg == NULL!!!\nUse -disableauthui parameter to disable VGUI login dialog", "Error", MB_OK);
 					bShowLoginDlg = true;
-					return g_pfnGameUI_RunFrame(_this);
+					g_pfnGameUI_RunFrame(_this);
+					return;
 				}
 
 				VFTHook(pLoginDlg, 0, 99, LoginDlg_OnCommand, (void*&)g_pfnLoginDlg_OnCommand); // before 10.07.2024 iFuncIndex 98
+				LauncherTrace("GameUI_RunFrame LoginDlg_OnCommand old=%p", g_pfnLoginDlg_OnCommand);
 
 				void* pRegisterBtn = g_pfnPanel_FindChildByName(pLoginDlg, "RegisterBtn", false);
 				void* pFindIDBtn = g_pfnPanel_FindChildByName(pLoginDlg, "FindIDBtn", false);
 				void* pFindPWBtn = g_pfnPanel_FindChildByName(pLoginDlg, "FindPWBtn", false);
 				void* pImagePanel1 = g_pfnPanel_FindChildByName(pLoginDlg, "ImagePanel1", false);
+				LauncherTrace("GameUI_RunFrame login children: register=%p findID=%p findPW=%p image=%p",
+					pRegisterBtn, pFindIDBtn, pFindPWBtn, pImagePanel1);
 
 				if (!pRegisterBtn || !pFindIDBtn || !pFindPWBtn || !pImagePanel1)
 				{
 					MessageBox(NULL, "Invalid ptrs!!!\nUse -disableauthui parameter to disable VGUI login dialog", "Error", MB_OK);
 					bShowLoginDlg = true;
-					return g_pfnGameUI_RunFrame(_this);
+					g_pfnGameUI_RunFrame(_this);
+					return;
 				}
 
 				void* v27 = (**(void* (__thiscall***)(void*))pRegisterBtn)(pRegisterBtn);
@@ -1097,6 +1801,7 @@ int __fastcall GameUI_RunFrame(void* _this)
 				(*(void(__thiscall**)(void*, const char*))(*(DWORD*)pRegisterBtn + 620))(pRegisterBtn, "Register"); // button->SetText() // before 23.12.23 pRegisterBtn + 604 // on 10.07.2024 pRegisterBtn + 612 // on 07.08.2024 pRegisterBtn + 620
 				//(*(void(__thiscall**)(void*, const char*))(*(DWORD*)pImagePanel1 + 600))(pImagePanel1, "resource/login.tga"); // imagepanel->SetImage()
 				(*(void(__thiscall**)(void*))(*(DWORD*)pLoginDlg + 840))(pLoginDlg); // loginDlg->DoModal() // before 23.12.23 pLoginDlg + 832 // on 10.07.2024 pLoginDlg + 840
+				LauncherTrace("GameUI_RunFrame LoginDlg DoModal called");
 
 				// i lost fucking g_pfnShowLoginDlg reference...
 				/*if (g_pfnShowLoginDlg)
@@ -1110,12 +1815,14 @@ int __fastcall GameUI_RunFrame(void* _this)
 			}
 			__except (EXCEPTION_EXECUTE_HANDLER)
 			{
+				LauncherTrace("GameUI_RunFrame exception while initializing auth UI");
 				MessageBox(NULL, "Something went wrong while initializing the Auth UI!!!\nUse -disableauthui parameter to disable VGUI login dialog", "Error", MB_OK);
 			}
 		}
 		bShowLoginDlg = true;
+		LauncherTrace("GameUI_RunFrame auth flow finished, bShowLoginDlg=1");
 	}
-	return g_pfnGameUI_RunFrame(_this);
+	g_pfnGameUI_RunFrame(_this);
 }
 
 void CSO_Bot_Add()
@@ -1136,6 +1843,107 @@ void CSO_Bot_Add()
 		side = atoi(g_pEngine->Cmd_Argv(1));
 	}
 	g_pBotManager->Bot_Add(side);
+}
+
+bool TryShowAuthUI()
+{
+	if (g_bDisableAuthUI)
+		return true;
+
+	if (!g_dwGameUIBase || !g_dwGameUISize || !g_pPanel)
+	{
+		LauncherTrace("TryShowAuthUI: not ready gameui=%08X size=%08X panel=%p", g_dwGameUIBase, g_dwGameUISize, g_pPanel);
+		return false;
+	}
+
+	__try
+	{
+		DWORD csoMainPanelPattern = FindPattern(CSOMAINPANEL_PTR_SIG_CSNZ, CSOMAINPANEL_PTR_MASK_CSNZ, g_dwGameUIBase, g_dwGameUIBase + g_dwGameUISize, 2);
+		void* pCSOMainPanel = NULL;
+		bool latestLayout = csoMainPanelPattern == 0;
+		if (csoMainPanelPattern)
+			pCSOMainPanel = **((void***)(csoMainPanelPattern));
+		else
+		{
+			DWORD latestMainPanelPtr = g_dwGameUIBase + 0xBAD15C;
+			pCSOMainPanel = *(void**)latestMainPanelPtr;
+			LauncherTrace("TryShowAuthUI: old CSOMainPanel pattern not found, latest global %08X -> %p", latestMainPanelPtr, pCSOMainPanel);
+		}
+
+		if (!pCSOMainPanel)
+		{
+			LauncherTrace("TryShowAuthUI: CSOMainPanel NULL pattern=%08X", csoMainPanelPattern);
+			return false;
+		}
+
+		void* pLoginDlg = *(void**)((DWORD)pCSOMainPanel + 364);
+		if (!pLoginDlg)
+			pLoginDlg = *(void**)((DWORD)pCSOMainPanel + 0x180);
+		if (!pLoginDlg)
+		{
+			LauncherTrace("TryShowAuthUI: LoginDlg NULL main=%p offsets=364/0x180", pCSOMainPanel);
+			return false;
+		}
+
+		if (!g_bLatestLoginCommandHooked)
+		{
+			DWORD latestOnCommand = g_dwGameUIBase + 0x57F090;
+			if (InlineHook((void*)latestOnCommand, Hook_LoginDlg_OnCommand_Latest, (void*&)g_pfnLoginDlg_OnCommand_Latest))
+			{
+				g_bLatestLoginCommandHooked = true;
+				LauncherTrace("TryShowAuthUI: latest OnCommand hooked at %08X old=%p", latestOnCommand, g_pfnLoginDlg_OnCommand_Latest);
+			}
+			else
+				LauncherTrace("TryShowAuthUI: latest OnCommand hook failed at %08X", latestOnCommand);
+		}
+
+		DWORD dwPanel_FindChildByNameRelAddr = FindPattern(CALL_PANEL_FINDCHILDBYNAME_SIG_CSNZ, CALL_PANEL_FINDCHILDBYNAME_MASK_CSNZ, g_dwGameUIBase, g_dwGameUIBase + g_dwGameUISize, 1);
+		if (!dwPanel_FindChildByNameRelAddr)
+		{
+			LauncherTrace("TryShowAuthUI: Panel_FindChildByName call not found");
+			return false;
+		}
+
+		g_pfnPanel_FindChildByName = (tPanel_FindChildByName)(dwPanel_FindChildByNameRelAddr + 4 + *(DWORD*)dwPanel_FindChildByNameRelAddr);
+		if (!g_pfnPanel_FindChildByName)
+		{
+			LauncherTrace("TryShowAuthUI: Panel_FindChildByName resolved NULL");
+			return false;
+		}
+
+		if (!latestLayout)
+			VFTHook(pLoginDlg, 0, 99, LoginDlg_OnCommand, (void*&)g_pfnLoginDlg_OnCommand);
+
+		void* pRegisterBtn = g_pfnPanel_FindChildByName(pLoginDlg, "RegisterBtn", false);
+		void* pFindIDBtn = g_pfnPanel_FindChildByName(pLoginDlg, "FindIDBtn", false);
+		void* pFindPWBtn = g_pfnPanel_FindChildByName(pLoginDlg, "FindPWBtn", false);
+		void* pImagePanel1 = g_pfnPanel_FindChildByName(pLoginDlg, "ImagePanel1", false);
+		LauncherTrace("TryShowAuthUI: main=%p loginDlg=%p children: register=%p findID=%p findPW=%p image=%p onCommand=%p",
+			pCSOMainPanel, pLoginDlg, pRegisterBtn, pFindIDBtn, pFindPWBtn, pImagePanel1, g_pfnLoginDlg_OnCommand);
+
+		if (!pRegisterBtn || !pFindIDBtn || !pFindPWBtn || !pImagePanel1)
+		{
+			LauncherTrace("TryShowAuthUI: invalid login children");
+			DumpClientPanelTree(pCSOMainPanel, "CSOMainPanel");
+			DumpClientPanelTree(pLoginDlg, "LoginDlg");
+			return false;
+		}
+
+		void* v27 = (**(void* (__thiscall***)(void*))pRegisterBtn)(pRegisterBtn);
+		g_pPanel->SetPos((vgui::IPanel*)v27, 50, 141);
+		(*(void(__thiscall**)(void*, bool))(*(DWORD*)pFindIDBtn + 160))(pFindIDBtn, false);
+		(*(void(__thiscall**)(void*, bool))(*(DWORD*)pFindPWBtn + 160))(pFindPWBtn, false);
+		(*(void(__thiscall**)(void*, const char*))(*(DWORD*)pRegisterBtn + 620))(pRegisterBtn, "Register");
+		(*(void(__thiscall**)(void*))(*(DWORD*)pLoginDlg + 840))(pLoginDlg);
+
+		LauncherTrace("TryShowAuthUI: DoModal called");
+		return true;
+	}
+	__except (EXCEPTION_EXECUTE_HANDLER)
+	{
+		LauncherTrace("TryShowAuthUI: exception");
+		return false;
+	}
 }
 
 CreateHookClass(const char*, GetSSLProtocolName)
@@ -1160,6 +1968,34 @@ CreateHookClass(int, ReadPacket, char* outBuf, int len, unsigned short* outLen, 
 	// this + 0x34 - read buf
 
 	// 0 - got message, 4 - wrong header, 6 - idk, 7 - got less than 4 bytes, 8 - bad sequence
+	unsigned short dataLen = outLen ? *outLen : 0;
+	unsigned char packetId = (result == 0 && outBuf && dataLen > 0) ? (unsigned char)outBuf[0] : 0xFF;
+	DWORD handler = 0;
+	DWORD vtbl = 0;
+	DWORD parseFn = 0;
+	if (result == 0 && g_pLatestHWSocketManager && packetId != 0xFF)
+	{
+		__try
+		{
+			handler = *(DWORD*)((DWORD)g_pLatestHWSocketManager + 0x10 + packetId * 4);
+			if (handler)
+			{
+				vtbl = *(DWORD*)handler;
+				parseFn = *(DWORD*)(vtbl + 8);
+			}
+		}
+		__except (EXCEPTION_EXECUTE_HANDLER)
+		{
+			handler = 0;
+			vtbl = 0;
+			parseFn = 0;
+		}
+	}
+
+	LauncherTrace("ReadPacket this=%p result=%d initial=%d len=%d outLen=%u id=%u handler=%08X vtbl=%08X parse=%08X rva=%08X",
+		ptr, result, initialMsg ? 1 : 0, len, dataLen, packetId,
+		handler, vtbl, parseFn, parseFn && g_dwEngineBase ? parseFn - g_dwEngineBase : 0);
+
 	if (!initialMsg && result == 0)
 	{
 		// create folder
@@ -1186,7 +2022,6 @@ CreateHookClass(int, ReadPacket, char* outBuf, int len, unsigned short* outLen, 
 
 		// write file
 		unsigned char* buf = (unsigned char*)(outBuf);
-		unsigned short dataLen = *outLen;
 
 		static int packetCounter = 0;
 
@@ -1198,8 +2033,13 @@ CreateHookClass(int, ReadPacket, char* outBuf, int len, unsigned short* outLen, 
 			snprintf(filename, sizeof(filename), "Packets/%d/Packet_%d.bin", directoryCounter, packetCounter++);
 
 		FILE* file = fopen(filename, "wb");
-		fwrite(buf, dataLen, 1, file);
-		fclose(file);
+		if (file)
+		{
+			fwrite(buf, dataLen, 1, file);
+			fclose(file);
+		}
+		else
+			LauncherTrace("ReadPacket dump fopen failed: %s", filename);
 	}
 
 	return result;
@@ -1256,8 +2096,10 @@ void CreateDebugConsole()
 
 DWORD WINAPI HookThread(LPVOID lpThreadParameter)
 {
+	LauncherTrace("HookThread start");
 	hWnd = FindWindow(NULL, "Counter-Strike Nexon: Studio");
 	oWndProc = (WNDPROC)SetWindowLongPtr(hWnd, GWLP_WNDPROC, (LONG_PTR)WndProc);
+	LauncherTrace("HookThread window=%p oldWndProc=%p", hWnd, oWndProc);
 
 	if (!g_bUseOriginalServer)
 	{
@@ -1267,19 +2109,53 @@ DWORD WINAPI HookThread(LPVOID lpThreadParameter)
 			Sleep(500);
 		}
 		g_dwGameUISize = GetModuleSize(GetModuleHandle("gameui.dll"));
+		LauncherTrace("HookThread gameui base=%08X size=%08X", g_dwGameUIBase, g_dwGameUISize);
 
 		if (g_pEngine)
 		{
 			g_pChattingManager = g_pEngine->GetChatManager();
+			LauncherTrace("HookThread ChattingManager=%p", g_pChattingManager);
 			if (!g_pChattingManager)
 				MessageBox(NULL, "g_pChattingManager == NULL!!!", "Error", MB_OK);
 		}
+		else
+			LauncherTrace("HookThread engine pointer is NULL");
 
 		CreateInterfaceFn gameui_factory = CaptureFactory("gameui.dll");
 		CreateInterfaceFn vgui2_factory = CaptureFactory("vgui2.dll");
 		g_pGameUI = (IGameUI*)(CaptureInterface(gameui_factory, GAMEUI_INTERFACE_VERSION));
 		g_pPanel = (vgui::IPanel*)(CaptureInterface(vgui2_factory, VGUI_PANEL_INTERFACE_VERSION));
-		VFTHook(g_pGameUI, 0, 7, GameUI_RunFrame, (void*&)g_pfnGameUI_RunFrame);
+		LauncherTrace("HookThread factories: gameui=%p vgui2=%p interfaces: gameui=%p panel=%p",
+			gameui_factory, vgui2_factory, g_pGameUI, g_pPanel);
+		VFTHook(g_pGameUI, 0, 6, GameUI_RunFrame, (void*&)g_pfnGameUI_RunFrame);
+		LauncherTrace("HookThread GameUI_RunFrame old=%p", g_pfnGameUI_RunFrame);
+
+		Sleep(1500);
+		if (ENABLE_LAUNCHER_CHAT_AUTOLOGIN)
+			SendLoginCommand();
+		if (ENABLE_LAUNCHER_CHAT_AUTOLOGIN && g_bLoginCommandSent)
+		{
+			bShowLoginDlg = true;
+			LauncherTrace("HookThread auth UI skipped after auto login command");
+		}
+
+		if (ENABLE_GAMEUI_AUTH_UI && !bShowLoginDlg && !g_bDisableAuthUI)
+		{
+			for (int i = 0; i < 80 && !bShowLoginDlg; i++)
+			{
+				if (TryShowAuthUI())
+				{
+					bShowLoginDlg = true;
+					LauncherTrace("HookThread auth UI shown after %d tries", i + 1);
+					break;
+				}
+
+				Sleep(100);
+			}
+
+			if (!bShowLoginDlg)
+				LauncherTrace("HookThread auth UI was not shown after retries");
+		}
 
 		while (!g_dwMpBase) // wait for mp.dll module
 		{
@@ -1334,6 +2210,7 @@ DWORD WINAPI HookThread(LPVOID lpThreadParameter)
 void Init(HMODULE hEngineModule, HMODULE hFileSystemModule)
 {
 	printf("Init()\n");
+	LauncherTrace("Init cmdline: %s", CommandLine()->GetCmdLine());
 
 	if (CommandLine()->CheckParm("-debug") || CommandLine()->CheckParm("-dev") || CommandLine()->CheckParm("+developer 1") || CommandLine()->CheckParm("-developer"))
 		CreateDebugConsole();
@@ -1372,12 +2249,26 @@ void Init(HMODULE hEngineModule, HMODULE hFileSystemModule)
 	g_bRegister = CommandLine()->CheckParm("-register");
 	if (CommandLine()->CheckParm("-login", &login) && login)
 	{
-		strncpy(g_pLogin, login, sizeof(g_pLogin));
+		strncpy(g_pLogin, login, sizeof(g_pLogin) - 1);
+		g_pLogin[sizeof(g_pLogin) - 1] = 0;
+		printf("g_pLogin = %s\n", g_pLogin);
+	}
+	else if (CommandLine()->CheckParm("-id", &login) && login)
+	{
+		strncpy(g_pLogin, login, sizeof(g_pLogin) - 1);
+		g_pLogin[sizeof(g_pLogin) - 1] = 0;
 		printf("g_pLogin = %s\n", g_pLogin);
 	}
 	if (CommandLine()->CheckParm("-password", &password) && password)
 	{
-		strncpy(g_pPassword, password, sizeof(g_pPassword));
+		strncpy(g_pPassword, password, sizeof(g_pPassword) - 1);
+		g_pPassword[sizeof(g_pPassword) - 1] = 0;
+		printf("g_pPassword = %s\n", g_pPassword);
+	}
+	else if (CommandLine()->CheckParm("-pw", &password) && password)
+	{
+		strncpy(g_pPassword, password, sizeof(g_pPassword) - 1);
+		g_pPassword[sizeof(g_pPassword) - 1] = 0;
 		printf("g_pPassword = %s\n", g_pPassword);
 	}
 
@@ -1391,12 +2282,19 @@ void Init(HMODULE hEngineModule, HMODULE hFileSystemModule)
 	g_bDumpAll = CommandLine()->CheckParm("-dumpall");
 	g_bDumpCrypt = CommandLine()->CheckParm("-dumpcrypt");
 	g_bDisableAuthUI = CommandLine()->CheckParm("-disableauthui");
-	g_bUseSSL = CommandLine()->CheckParm("-usessl");
+	g_bUseSSL = !CommandLine()->CheckParm("-nousessl");
+	if (CommandLine()->CheckParm("-usessl"))
+		g_bUseSSL = true;
 	g_bWriteMetadata = CommandLine()->CheckParm("-writemetadata");
 	g_bLoadDediCsvFromFile = CommandLine()->CheckParm("-loaddedicsvfromfile");
 	g_bNoNGHook = CommandLine()->CheckParm("-nonghook");
+	g_bDisableLocalAuthCheck = CommandLine()->CheckParm("-disablelocalauthcheck");
 
 	printf("g_pServerIP = %s, g_pServerPort = %s\n", g_pServerIP, g_pServerPort);
+	LauncherTrace("Init server=%s:%s flags: original=%d disableAuthUI=%d useSSL=%d noNG=%d register=%d disableLocalAuth=%d loginLen=%d passwordLen=%d",
+		g_pServerIP, g_pServerPort, g_bUseOriginalServer ? 1 : 0, g_bDisableAuthUI ? 1 : 0,
+		g_bUseSSL ? 1 : 0, g_bNoNGHook ? 1 : 0, g_bRegister ? 1 : 0, g_bDisableLocalAuthCheck ? 1 : 0,
+		(int)strlen(g_pLogin), (int)strlen(g_pPassword));
 }
 
 void Hook(HMODULE hEngineModule, HMODULE hFileSystemModule)
@@ -1410,19 +2308,25 @@ void Hook(HMODULE hEngineModule, HMODULE hFileSystemModule)
 	{
 		find = FindPattern(NGCLIENT_INIT_SIG_CSNZ, NGCLIENT_INIT_MASK_CSNZ, g_dwEngineBase, g_dwEngineBase + g_dwEngineSize, NULL);
 		if (!find)
-			MessageBox(NULL, "NGClient_Init == NULL!!!", "Error", MB_OK);
+			LauncherTrace("NGClient_Init == NULL!!!");
 		else
 			InlineHookFromCallOpcode((void*)find, NGClient_Return1, dummy, dummy);
 
 		find = FindPattern(NGCLIENT_QUIT_SIG_CSNZ, NGCLIENT_QUIT_MASK_CSNZ, g_dwEngineBase, g_dwEngineBase + g_dwEngineSize, NULL);
 		if (!find)
-			MessageBox(NULL, "NGClient_Quit == NULL!!!", "Error", MB_OK);
+		{
+			//훅 위치 변경
+			LauncherTrace("NGClient_Quit == NULL!!!");
+		}
 		else
 			InlineHookFromCallOpcode((void*)find, NGClient_Void, dummy, dummy);
 
 		find = FindPattern(PACKET_HACK_SEND_SIG_CSNZ, PACKET_HACK_SEND_MASK_CSNZ, g_dwEngineBase, g_dwEngineBase + g_dwEngineSize, NULL);
 		if (!find)
-			MessageBox(NULL, "Packet_Hack_Send == NULL!!!", "Error", MB_OK);
+		{
+			//훅 위치 변경
+			LauncherTrace("Packet_Hack_Send == NULL!!!");
+		}
 		else
 		{
 			InlineHookFromCallOpcode((void*)find, NGClient_Void, dummy, dummy);
@@ -1431,7 +2335,10 @@ void Hook(HMODULE hEngineModule, HMODULE hFileSystemModule)
 
 		find = FindPattern(PACKET_HACK_PARSE_SIG_CSNZ, PACKET_HACK_PARSE_MASK_CSNZ, g_dwEngineBase, g_dwEngineBase + g_dwEngineSize, NULL);
 		if (!find)
-			MessageBox(NULL, "Packet_Hack_Parse == NULL!!!", "Error", MB_OK);
+		{
+			//훅 위치 변경
+			LauncherTrace("Packet_Hack_Parse == NULL!!!");
+		}
 		else
 			InlineHook((void*)find, Hook_Packet_Hack_Parse, dummy);
 	}
@@ -1468,6 +2375,50 @@ void Hook(HMODULE hEngineModule, HMODULE hFileSystemModule)
 		else
 			InlineHook((void*)find, Hook_HolePunch_GetUserSocketInfo, (void*&)g_pfnHolePunch_GetUserSocketInfo);
 
+		find = g_dwEngineBase + HW_LOGIN_DLG_CTOR_RVA;
+		if (!InlineHook((void*)find, Hook_HWLoginDlgConstructor, (void*&)g_pfnHWLoginDlgConstructor))
+			LauncherTrace("HWLoginDlg constructor hook failed at %08X", find);
+		else
+			LauncherTrace("HWLoginDlg constructor hooked at %08X old=%p", find, g_pfnHWLoginDlgConstructor);
+
+		find = g_dwEngineBase + HW_LOGIN_DLG_ONCOMMAND_RVA;
+		if (!InlineHook((void*)find, Hook_HWLoginDlg_OnCommand, (void*&)g_pfnHWLoginDlg_OnCommand))
+			LauncherTrace("HWLoginDlg OnCommand hook failed at %08X", find);
+		else
+			LauncherTrace("HWLoginDlg OnCommand hooked at %08X old=%p", find, g_pfnHWLoginDlg_OnCommand);
+
+		find = g_dwEngineBase + HW_AUTH_MANAGER_AUTH_RVA;
+		if (!InlineHook((void*)find, Hook_HWAuthManager_Auth, (void*&)g_pfnHWAuthManager_Auth))
+			LauncherTrace("HWAuthManager::Auth hook failed at %08X", find);
+		else
+			LauncherTrace("HWAuthManager::Auth hooked at %08X old=%p", find, g_pfnHWAuthManager_Auth);
+
+		find = g_dwEngineBase + HW_SOCKET_MANAGER_EVENT_RVA;
+		if (!InlineHook((void*)find, Hook_HWSocketManager_Event, (void*&)g_pfnHWSocketManager_Event))
+			LauncherTrace("HWSocketManager::Event hook failed at %08X", find);
+		else
+			LauncherTrace("HWSocketManager::Event hooked at %08X old=%p", find, g_pfnHWSocketManager_Event);
+
+		find = g_dwEngineBase + HW_SOCKET_MANAGER_CONNECT_RVA;
+		if (!InlineHook((void*)find, Hook_HWSocketManager_Connect, (void*&)g_pfnHWSocketManager_Connect))
+			LauncherTrace("HWSocketManager::Connect hook failed at %08X", find);
+		else
+			LauncherTrace("HWSocketManager::Connect hooked at %08X old=%p", find, g_pfnHWSocketManager_Connect);
+
+		find = g_dwEngineBase + HW_WSARECV_WRAPPER_RVA;
+		if (*(BYTE*)find == 0x55 && *(BYTE*)(find + 1) == 0x8B && *(BYTE*)(find + 2) == 0xEC)
+		{
+			if (!InlineHook((void*)find, Hook_HWSocket_WSARecv, (void*&)g_pfnHWSocket_WSARecv))
+				LauncherTrace("HWSocket::WSARecv wrapper hook failed at %08X", find);
+			else
+				LauncherTrace("HWSocket::WSARecv wrapper hooked at %08X old=%p", find, g_pfnHWSocket_WSARecv);
+		}
+		else
+		{
+			LauncherTrace("HWSocket::WSARecv wrapper RVA mismatch at %08X bytes=%02X %02X %02X",
+				find, *(BYTE*)find, *(BYTE*)(find + 1), *(BYTE*)(find + 2));
+		}
+
 		/*
 		{
 			DWORD pushStr = FindPush(g_dwEngineBase, g_dwEngineBase + g_dwEngineSize, (PCHAR)("resource/zombi/ZombieSkillTable_Dedi.csv"));
@@ -1500,7 +2451,7 @@ void Hook(HMODULE hEngineModule, HMODULE hFileSystemModule)
 			// NOP dedi check on Zombie Skills
 			pushStr = FindPush(g_dwEngineBase, g_dwEngineBase + g_dwEngineSize, (PCHAR)("resource/zombi/ZombieSkillProperty_Dedi/ZombieSkillProperty_Crazy.csv"));
 			if (!pushStr)
-				MessageBox(NULL, "ZombieSkillProperty_Patch == NULL!!!", "Error", MB_OK);
+				LauncherTrace("ZombieSkillProperty_Patch == NULL!!!");
 			else
 			{
 				patchAddr = pushStr - 0x23;
@@ -1511,7 +2462,7 @@ void Hook(HMODULE hEngineModule, HMODULE hFileSystemModule)
 			// NOP dedi check on Fire Bomb
 			pushStr = FindPush(g_dwEngineBase, g_dwEngineBase + g_dwEngineSize, (PCHAR)("resource/zombi/FireBombOption_Dedi.csv"));
 			if (!pushStr)
-				MessageBox(NULL, "FireBombOption_Patch == NULL!!!", "Error", MB_OK);
+				LauncherTrace("FireBombOption_Patch == NULL!!!");
 			else
 			{
 				patchAddr = pushStr - 0x8;
@@ -1521,7 +2472,7 @@ void Hook(HMODULE hEngineModule, HMODULE hFileSystemModule)
 
 			find = FindPattern(CREATESTRINGTABLE_SIG_CSNZ, CREATESTRINGTABLE_MASK_CSNZ, g_dwEngineBase, g_dwEngineBase + g_dwEngineSize, NULL);
 			if (!find)
-				MessageBox(NULL, "CreateStringTable == NULL!!!", "Error", MB_OK);
+				LauncherTrace("CreateStringTable == NULL!!!");
 			else
 			{
 				InlineHook((void*)find, Hook_CreateStringTable, (void*&)g_pfnCreateStringTable);
@@ -1530,9 +2481,9 @@ void Hook(HMODULE hEngineModule, HMODULE hFileSystemModule)
 				g_pfnParseCSV = (tParseCSV)(parseCsvCallAddr + 4 + *(DWORD*)parseCsvCallAddr);
 			}
 
-			find = FindPattern(LOADJSON_SIG_CSNZ, LOADJSON_MASK_CSNZ, g_dwEngineBase, g_dwEngineBase + g_dwEngineSize, NULL);
+			find = FindPatternCompat(LOADJSON_SIG_CSNZ_LATEST, LOADJSON_MASK_CSNZ_LATEST, LOADJSON_SIG_CSNZ, LOADJSON_MASK_CSNZ, g_dwEngineBase, g_dwEngineBase + g_dwEngineSize);
 			if (!find)
-				MessageBox(NULL, "LoadJson == NULL!!!", "Error", MB_OK);
+				LauncherTrace("LoadJson == NULL!!!");
 			else
 				InlineHook((void*)find, Hook_LoadJson, (void*&)g_pfnLoadJson);
 		}
@@ -1551,71 +2502,113 @@ void Hook(HMODULE hEngineModule, HMODULE hFileSystemModule)
 		// hook Pbuf_AddText to allow any cvar or cmd input from console
 		g_pEngine->Pbuf_AddText = Pbuf_AddText;
 
-	if (g_bDumpMetadata || g_bWriteMetadata || g_bIgnoreMetadata)
+	if (g_bDumpMetadata || g_bWriteMetadata || g_bIgnoreMetadata || !g_bUseOriginalServer)
 	{
 		find = FindPattern(PACKET_METADATA_PARSE_SIG_CSNZ, PACKET_METADATA_PARSE_MASK_CSNZ, g_dwEngineBase, g_dwEngineBase + g_dwEngineSize, NULL);
 		if (!find)
-			MessageBox(NULL, "Packet_Metadata_Parse == NULL!!!", "Error", MB_OK);
+			LauncherTrace("Packet_Metadata_Parse == NULL!!!");
 		else
 		{
 			InlineHook((void*)find, Hook_Packet_Metadata_Parse, (void*&)g_pfnPacket_Metadata_Parse);
+			LauncherTrace("Packet_Metadata_Parse hooked at %08X old=%p", find, g_pfnPacket_Metadata_Parse);
 			if (g_pEngine)
 				g_pEngine->pfnAddCommand("metadata_requestall", Metadata_RequestAll);
 		}
 	}
 
-	if (g_bDumpQuest)
+	if (g_bDumpQuest || !g_bUseOriginalServer)
 	{
 		find = FindPattern(PACKET_QUEST_PARSE_SIG_CSNZ, PACKET_QUEST_PARSE_MASK_CSNZ, g_dwEngineBase, g_dwEngineBase + g_dwEngineSize, NULL);
 		if (!find)
-			MessageBox(NULL, "Packet_Quest_Parse == NULL!!!", "Error", MB_OK);
+			LauncherTrace("Packet_Quest_Parse == NULL!!!");
 		else
+		{
 			InlineHook((void*)find, Hook_Packet_Quest_Parse, (void*&)g_pfnPacket_Quest_Parse);
+			LauncherTrace("Packet_Quest_Parse hooked at %08X old=%p", find, g_pfnPacket_Quest_Parse);
+		}
 	}
 
-	if (g_bDumpUMsg)
+	if (g_bDumpUMsg || !g_bUseOriginalServer)
 	{
 		find = FindPattern(PACKET_UMSG_PARSE_SIG_CSNZ, PACKET_UMSG_PARSE_MASK_CSNZ, g_dwEngineBase, g_dwEngineBase + g_dwEngineSize, NULL);
 		if (!find)
-			MessageBox(NULL, "Packet_UMsg_Parse == NULL!!!", "Error", MB_OK);
+			LauncherTrace("Packet_UMsg_Parse == NULL!!!");
 		else
+		{
 			InlineHook((void*)find, Hook_Packet_UMsg_Parse, (void*&)g_pfnPacket_UMsg_Parse);
+			LauncherTrace("Packet_UMsg_Parse hooked at %08X old=%p", find, g_pfnPacket_UMsg_Parse);
+		}
 	}
 
-	if (g_bDumpAlarm)
+	if (g_bDumpAlarm || !g_bUseOriginalServer)
 	{
 		find = FindPattern(PACKET_ALARM_PARSE_SIG_CSNZ, PACKET_ALARM_PARSE_MASK_CSNZ, g_dwEngineBase, g_dwEngineBase + g_dwEngineSize, NULL);
 		if (!find)
-			MessageBox(NULL, "Packet_Alarm_Parse == NULL!!!", "Error", MB_OK);
+			LauncherTrace("Packet_Alarm_Parse == NULL!!!");
 		else
+		{
 			InlineHook((void*)find, Hook_Packet_Alarm_Parse, (void*&)g_pfnPacket_Alarm_Parse);
+			LauncherTrace("Packet_Alarm_Parse hooked at %08X old=%p", find, g_pfnPacket_Alarm_Parse);
+		}
 	}
 
-	if (g_bDumpItem)
+	if (g_bDumpItem || !g_bUseOriginalServer)
 	{
 		find = FindPattern(PACKET_ITEM_PARSE_SIG_CSNZ, PACKET_ITEM_PARSE_MASK_CSNZ, g_dwEngineBase, g_dwEngineBase + g_dwEngineSize, NULL);
 		if (!find)
-			MessageBox(NULL, "Packet_Item_Parse == NULL!!!", "Error", MB_OK);
+			LauncherTrace("Packet_Item_Parse == NULL!!!");
 		else
+		{
 			InlineHook((void*)find, Hook_Packet_Item_Parse, (void*&)g_pfnPacket_Item_Parse);
+			LauncherTrace("Packet_Item_Parse hooked at %08X old=%p", find, g_pfnPacket_Item_Parse);
+		}
 	}
 
-	if (g_bDumpCrypt)
+	if (g_bDumpCrypt || !g_bUseOriginalServer)
 	{
 		find = FindPattern(PACKET_CRYPT_PARSE_SIG_CSNZ, PACKET_CRYPT_PARSE_MASK_CSNZ, g_dwEngineBase, g_dwEngineBase + g_dwEngineSize, NULL);
 		if (!find)
-			MessageBox(NULL, "Packet_Crypt_Parse == NULL!!!", "Error", MB_OK);
+			LauncherTrace("Packet_Crypt_Parse == NULL!!!");
 		else
+		{
 			InlineHook((void*)find, Hook_Packet_Crypt_Parse, (void*&)g_pfnPacket_Crypt_Parse);
+			LauncherTrace("Packet_Crypt_Parse hooked at %08X old=%p", find, g_pfnPacket_Crypt_Parse);
+		}
 	}
 
-	if (g_bDumpAll)
+	if (g_bDumpAll || !g_bUseOriginalServer)
 	{
 		find = FindPattern(READPACKET_SIG_CSNZ, READPACKET_MASK_CSNZ, g_dwEngineBase, g_dwEngineBase + g_dwEngineSize, NULL);
 		if (!find)
 			MessageBox(NULL, "ReadPacket == NULL!!!", "Error", MB_OK);
 		else
+		{
+			DWORD readPacketFunc = find + 5 + *(DWORD*)(find + 1);
+			LauncherTrace("ReadPacket call located at %08X target=%08X", find, readPacketFunc);
 			InlineHookFromCallOpcode((void*)find, Hook_ReadPacket, (void*&)g_pfnReadPacket, dummy);
+			LauncherTrace("ReadPacket hooked via call at %08X old=%p", find, g_pfnReadPacket);
+
+			DWORD eventCall = g_dwEngineBase + HW_READPACKET_EVENT_CALL_RVA;
+			if (*(BYTE*)eventCall == 0xE8)
+			{
+				DWORD eventTarget = eventCall + 5 + *(DWORD*)(eventCall + 1);
+				if (eventTarget == readPacketFunc)
+				{
+					void* eventDummy = NULL;
+					InlineHookFromCallOpcode((void*)eventCall, Hook_ReadPacket, eventDummy, dummy);
+					LauncherTrace("ReadPacket hooked via event call at %08X target=%08X", eventCall, eventTarget);
+				}
+				else
+				{
+					LauncherTrace("ReadPacket event call target mismatch at %08X target=%08X expected=%08X",
+						eventCall, eventTarget, readPacketFunc);
+				}
+			}
+			else
+			{
+				LauncherTrace("ReadPacket event call opcode mismatch at %08X opcode=%02X", eventCall, *(BYTE*)eventCall);
+			}
+		}
 	}
 
 	// patch launcher name in hw.dll to fix annoying message box (length of launcher filename must be < original name)
@@ -1625,10 +2618,11 @@ void Hook(HMODULE hEngineModule, HMODULE hFileSystemModule)
 	else
 		WriteMemory((void*)find, (BYTE*)"CSOLauncher.exe", strlen("CSOLauncher.exe") + 1);
 
-	// patch 100 fps limit
+	// patch 100 fps limit 
+	// 훅 위치 변경
 	find = FindPush(g_dwEngineBase, g_dwEngineBase + g_dwEngineSize, "%3i fps -- host(%3.0f) sv(%3.0f) cl(%3.0f) gfx(%3.0f) snd(%3.0f) ents(%d)\n", 2);
 	if (!find)
-		MessageBox(NULL, "100Fps_Patch == NULL!!!", "Error", MB_OK);
+		LauncherTrace("100Fps_Patch == NULL!!!");
 	else
 	{
 		DWORD patchAddr = find - 0x4DA;
@@ -1646,7 +2640,7 @@ void Hook(HMODULE hEngineModule, HMODULE hFileSystemModule)
 			InlineHookFromCallOpcode((void*)find, Hook_GetSSLProtocolName, (void*&)g_pfnGetSSLProtocolName, dummy);
 
 		// hook SocketConstructor to create ctx objects
-		find = FindPattern(SOCKETCONSTRUCTOR_SIG_CSNZ, SOCKETCONSTRUCTOR_MASK_CSNZ, g_dwEngineBase, g_dwEngineBase + g_dwEngineSize, NULL);
+		find = FindPatternCompat(SOCKETCONSTRUCTOR_SIG_CSNZ, SOCKETCONSTRUCTOR_MASK_CSNZ, SOCKETCONSTRUCTOR_SIG_CSNZ_LATEST, SOCKETCONSTRUCTOR_MASK_CSNZ_LATEST, g_dwEngineBase, g_dwEngineBase + g_dwEngineSize);
 		if (!find)
 			MessageBox(NULL, "SocketConstructor == NULL!!!", "Error", MB_OK);
 		else

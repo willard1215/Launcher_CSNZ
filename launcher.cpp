@@ -90,10 +90,12 @@ int CALLBACK WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLi
 		CommandLine()->AppendParm("-forcevalve", NULL);
 
 	if (CommandLine()->CheckParm("-lang") == NULL)
-		CommandLine()->AppendParm("-lang", "na_"); 	// the game won't load without this line
+		CommandLine()->AppendParm("-lang", "ko_"); 	// the game won't load without this line
 
+	// 메인루프 진입
 	while (1)
 	{
+		// filesystem_nar.dll 로드
 		HINTERFACEMODULE hFileSystem = LoadFilesystemModule();
 
 		if (!hFileSystem)
@@ -115,7 +117,7 @@ int CALLBACK WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLi
 		HINTERFACEMODULE hEngine;
 		bool bUseBlobDLL = false;
 
-
+		// hw.dll로드
 		hEngine = Sys_LoadModule(pszEngineDLL);
 		if (!hEngine)
 		{

@@ -205,16 +205,34 @@ hook_t* VFTHook(void* pClass, int iTableIndex, int iFuncIndex, void* pNewFuncAdd
 hook_t* IATHook(HMODULE hModule, const char* pszModuleName, const char* pszFuncName, void* pNewFuncAddr, void*& pCallBackFuncAddr)
 {
 	IMAGE_NT_HEADERS* pHeader = (IMAGE_NT_HEADERS*)((DWORD)hModule + ((IMAGE_DOS_HEADER*)hModule)->e_lfanew);
-	IMAGE_IMPORT_DESCRIPTOR* pImport = (IMAGE_IMPORT_DESCRIPTOR*)((DWORD)hModule + pHeader->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_IMPORT].VirtualAddress);
+	DWORD importRva = pHeader->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_IMPORT].VirtualAddress;
+	if (!importRva)
+		return NULL;
 
+	IMAGE_IMPORT_DESCRIPTOR* pImport = (IMAGE_IMPORT_DESCRIPTOR*)((DWORD)hModule + importRva);
 	while (pImport->Name && _stricmp((const char*)((DWORD)hModule + pImport->Name), pszModuleName))
 		pImport++;
 
-	DWORD dwFuncAddr = (DWORD)GetProcAddress(GetModuleHandle(pszModuleName), pszFuncName);
+	if (!pImport->Name)
+		return NULL;
+
+	HMODULE hImportModule = GetModuleHandle(pszModuleName);
+	if (!hImportModule)
+		hImportModule = LoadLibrary(pszModuleName);
+	if (!hImportModule)
+		return NULL;
+
+	DWORD dwFuncAddr = (DWORD)GetProcAddress(hImportModule, pszFuncName);
+	if (!dwFuncAddr)
+		return NULL;
+
 	IMAGE_THUNK_DATA* pThunk = (IMAGE_THUNK_DATA*)((DWORD)hModule + pImport->FirstThunk);
 
-	while (pThunk->u1.Function != dwFuncAddr)
+	while (pThunk->u1.Function && pThunk->u1.Function != dwFuncAddr)
 		pThunk++;
+
+	if (!pThunk->u1.Function)
+		return NULL;
 
 	tagIATDATA* info = new tagIATDATA;
 	info->pAPIInfoAddr = &pThunk->u1.Function;
