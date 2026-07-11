@@ -203,6 +203,74 @@ void LauncherTrace(const char* fmt, ...)
 	fclose(file);
 }
 
+static void FormatHexPreview(char* out, int outSize, const unsigned char* data, int size, int limit = 48)
+{
+	static const char* kHex = "0123456789ABCDEF";
+	if (!out || outSize <= 0)
+		return;
+	out[0] = '\0';
+	if (!data || size <= 0)
+		return;
+
+	int count = size < limit ? size : limit;
+	int pos = 0;
+	for (int i = 0; i < count; ++i)
+	{
+		if (pos + 4 >= outSize)
+			break;
+		if (i)
+			out[pos++] = ' ';
+		unsigned char b = data[i];
+		out[pos++] = kHex[b >> 4];
+		out[pos++] = kHex[b & 0x0F];
+	}
+	if (size > limit && pos + 5 < outSize)
+	{
+		out[pos++] = ' ';
+		out[pos++] = '.';
+		out[pos++] = '.';
+		out[pos++] = '.';
+	}
+	out[pos] = '\0';
+}
+
+static void DumpHWSocketReadState(void* socket, const char* label)
+{
+	if (!socket)
+		return;
+
+	__try
+	{
+		unsigned char* bufStart = *(unsigned char**)((DWORD)socket + 0x24);
+		unsigned char* bufEnd = *(unsigned char**)((DWORD)socket + 0x2C);
+		unsigned char* readPtr = *(unsigned char**)((DWORD)socket + 0x34);
+		int buffered = (bufEnd && readPtr && bufEnd >= readPtr) ? (int)(bufEnd - readPtr) : -1;
+		int totalBuffered = (bufEnd && bufStart && bufEnd >= bufStart) ? (int)(bufEnd - bufStart) : -1;
+		int previewSize = buffered > 0 ? buffered : 0;
+		char preview[192];
+		FormatHexPreview(preview, sizeof(preview), readPtr, previewSize);
+		char fullPreview[256];
+		FormatHexPreview(fullPreview, sizeof(fullPreview), bufStart, totalBuffered > 0 ? totalBuffered : 0);
+		unsigned char* aroundPtr = readPtr && readPtr >= bufStart + 16 ? readPtr - 16 : bufStart;
+		int aroundSize = (bufEnd && aroundPtr && bufEnd >= aroundPtr) ? (int)(bufEnd - aroundPtr) : 0;
+		char aroundPreview[256];
+		FormatHexPreview(aroundPreview, sizeof(aroundPreview), aroundPtr, aroundSize);
+
+		LauncherTrace("HWSocketReadState[%s] socket=%p flags1c=%u flags1d=%u flag44=%u flag45=%u lastSeq=%d buf=%p read=%p end=%p buffered=%d total=%d preview=%s full=%s around=%s",
+			label, socket,
+			*(unsigned char*)((DWORD)socket + 0x1C),
+			*(unsigned char*)((DWORD)socket + 0x1D),
+			*(unsigned char*)((DWORD)socket + 0x44),
+			*(unsigned char*)((DWORD)socket + 0x45),
+			(int)*(signed char*)((DWORD)socket + 0x39),
+			bufStart, readPtr, bufEnd, buffered, totalBuffered, preview, fullPreview, aroundPreview);
+	}
+	__except (EXCEPTION_EXECUTE_HANDLER)
+	{
+		LauncherTrace("HWSocketReadState[%s] exception socket=%p", label, socket);
+	}
+}
+
 void DumpVGuiPanelTree(vgui::IPanel* panel, const char* label, int depth = 0, int maxDepth = 4)
 {
 	if (!g_pPanel || !panel || depth > maxDepth)
@@ -1075,6 +1143,24 @@ const char* GetMetadataName(int metaDataID)
 	return NULL;
 }
 
+static std::string MakeMetadataDumpPath(int metaDataID, const char* metaDataName, const char* ext)
+{
+	char prefix[64];
+	sprintf_s(prefix, "MetadataDump/Metadata_%03d_", metaDataID);
+
+	std::string safeName = metaDataName ? metaDataName : "unknown";
+	for (char& ch : safeName)
+	{
+		if (ch == '/' || ch == '\\' || ch == ':' || ch == '*' || ch == '?' ||
+			ch == '"' || ch == '<' || ch == '>' || ch == '|')
+		{
+			ch = '_';
+		}
+	}
+
+	return std::string(prefix) + safeName + ext;
+}
+
 #pragma region Packet
 void* g_pPacketMetadataParse;
 
@@ -1096,7 +1182,6 @@ CreateHookClass(int, Packet_Metadata_Parse, void* packetBuffer, int packetSize)
 
 	if (g_bDumpMetadata)
 	{
-		char name[MAX_PATH];
 		FILE* file = NULL;
 		unsigned short metaDataSize = 0;
 
@@ -1106,18 +1191,22 @@ CreateHookClass(int, Packet_Metadata_Parse, void* packetBuffer, int packetSize)
 		{
 		case zipMetadata:
 		{
-			metaDataSize = *((unsigned short*)((char*)packetBuffer + 1));
-
-			sprintf_s(name, "MetadataDump/Metadata_%s.zip", metaDataName);
+			if (packetSize >= 4)
+			{
+				unsigned char chunkFlag = *((unsigned char*)((char*)packetBuffer + 1));
+				metaDataSize = *((unsigned short*)((char*)packetBuffer + 2));
+				LauncherTrace("Packet_Metadata_Parse dump zip metadataID=%u flag=0x%02X zipSize=%u packetSize=%d",
+					metaDataID, chunkFlag, metaDataSize, packetSize);
+			}
 			break;
 		}
 		case binToJsonMetadata:
 		{
-			sprintf_s(name, "MetadataDump/%s.json", metaDataName);
-			file = fopen(name, "wb");
+			std::string name = MakeMetadataDumpPath(metaDataID, metaDataName, ".json");
+			file = fopen(name.c_str(), "wb");
 			if (!file)
 			{
-				printf("Can't open '%s' file to write metadata dump\n", name);
+				printf("Can't open '%s' file to write metadata dump\n", name.c_str());
 			}
 			else
 			{
@@ -1248,26 +1337,27 @@ CreateHookClass(int, Packet_Metadata_Parse, void* packetBuffer, int packetSize)
 		}
 		case binMetadata:
 		{
-			if (metaDataName)
-				sprintf_s(name, "MetadataDump/Metadata_%s.bin", metaDataName);
-			else
-				sprintf_s(name, "MetadataDump/Metadata_Unk%d.bin", metaDataID);
 			break;
 		}
 		}
 
 		if (metaDataType != binToJsonMetadata)
 		{
-			file = fopen(name, "wb");
+			const char* ext = metaDataType == zipMetadata ? ".zip" : ".bin";
+			std::string name = MakeMetadataDumpPath(metaDataID, metaDataName, ext);
+			file = fopen(name.c_str(), "wb");
 			if (!file)
 			{
-				printf("Can't open '%s' file to write metadata dump\n", name);
+				printf("Can't open '%s' file to write metadata dump\n", name.c_str());
 			}
 			else
 			{
 				if (metaDataType == zipMetadata)
 				{
-					fwrite(((unsigned short*)((char*)packetBuffer + 3)), *((unsigned short*)((char*)packetBuffer + 1)), 1, file);
+					if (packetSize >= 4 && metaDataSize <= packetSize - 4)
+					{
+						fwrite((char*)packetBuffer + 4, metaDataSize, 1, file);
+					}
 				}
 				else
 				{
@@ -1278,6 +1368,14 @@ CreateHookClass(int, Packet_Metadata_Parse, void* packetBuffer, int packetSize)
 		}
 	}
 
+	auto CallOriginalMetadataParse = [&](void* buffer, int size) -> int
+	{
+		LauncherTrace("Packet_Metadata_Parse call original metadataID=%u name=%s size=%d", metaDataID, metaDataName ? metaDataName : "(null)", size);
+		int result = g_pfnPacket_Metadata_Parse(ptr, buffer, size);
+		LauncherTrace("Packet_Metadata_Parse leave metadataID=%u name=%s result=%d", metaDataID, metaDataName ? metaDataName : "(null)", result);
+		return result;
+	};
+
 	if (g_bWriteMetadata && metaDataType == zipMetadata)
 	{
 		HZIP hMetaData = CreateZip(0, MAX_ZIP_SIZE, ZIP_MEMORY);
@@ -1285,7 +1383,7 @@ CreateHookClass(int, Packet_Metadata_Parse, void* packetBuffer, int packetSize)
 		if (!hMetaData)
 		{
 			printf("CreateZip returned NULL.\n");
-			return g_pfnPacket_Metadata_Parse(ptr, packetBuffer, packetSize);
+			return CallOriginalMetadataParse(packetBuffer, packetSize);
 		}
 
 		char path[MAX_PATH];
@@ -1295,7 +1393,7 @@ CreateHookClass(int, Packet_Metadata_Parse, void* packetBuffer, int packetSize)
 		if (ZipAdd(hMetaData, metaDataName, path, 0, ZIP_FILENAME))
 		{
 			printf("ZipAdd returned error.\n");
-			return g_pfnPacket_Metadata_Parse(ptr, packetBuffer, packetSize);
+			return CallOriginalMetadataParse(packetBuffer, packetSize);
 		}
 
 		void* buffer;
@@ -1305,23 +1403,24 @@ CreateHookClass(int, Packet_Metadata_Parse, void* packetBuffer, int packetSize)
 		if (length == 0)
 		{
 			printf("ZipGetMemory returned zero length.\n");
-			return g_pfnPacket_Metadata_Parse(ptr, packetBuffer, packetSize);
+			return CallOriginalMetadataParse(packetBuffer, packetSize);
 		}
 
 		std::vector<unsigned char> destBuffer;
 		std::vector<unsigned char> metaDataBuffer((char*)buffer, (char*)buffer + length);
 
 		destBuffer.push_back(metaDataID);
+		destBuffer.push_back(5);
 		destBuffer.push_back((unsigned char)(length & 0xFF));
 		destBuffer.push_back((unsigned char)(length >> 8));
 		destBuffer.insert(destBuffer.end(), metaDataBuffer.begin(), metaDataBuffer.end());
 
 		CloseZip(hMetaData);
 
-		return g_pfnPacket_Metadata_Parse(ptr, static_cast<void*>(destBuffer.data()), destBuffer.size());
+		return CallOriginalMetadataParse(static_cast<void*>(destBuffer.data()), destBuffer.size());
 	}
 
-	return g_pfnPacket_Metadata_Parse(ptr, packetBuffer, packetSize);
+	return CallOriginalMetadataParse(packetBuffer, packetSize);
 }
 
 void Metadata_RequestAll()
@@ -1948,7 +2047,8 @@ bool TryShowAuthUI()
 
 CreateHookClass(const char*, GetSSLProtocolName)
 {
-	return "None";
+	LauncherTrace("GetSSLProtocolName -> TLSv1");
+	return "TLSv1";
 }
 
 CreateHookClassType(void*, SocketConstructor, int, int a2, int a3, char a4)
@@ -1995,6 +2095,15 @@ CreateHookClass(int, ReadPacket, char* outBuf, int len, unsigned short* outLen, 
 	LauncherTrace("ReadPacket this=%p result=%d initial=%d len=%d outLen=%u id=%u handler=%08X vtbl=%08X parse=%08X rva=%08X",
 		ptr, result, initialMsg ? 1 : 0, len, dataLen, packetId,
 		handler, vtbl, parseFn, parseFn && g_dwEngineBase ? parseFn - g_dwEngineBase : 0);
+
+	if (!initialMsg && result != 0)
+		DumpHWSocketReadState(ptr, "read-fail");
+
+	if (result == 0 && (packetId == 1 || packetId == 7 || packetId == 91 || packetId == 109))
+	{
+		LauncherTrace("ReadPacket post-parse handler table dump after id=%u", packetId);
+		DumpHWSocketManagerHandlers(g_pLatestHWSocketManager);
+	}
 
 	if (!initialMsg && result == 0)
 	{
@@ -2630,7 +2739,7 @@ void Hook(HMODULE hEngineModule, HMODULE hFileSystemModule)
 		WriteMemory((void*)patchAddr, (BYTE*)patch, sizeof(patch));
 	}
 
-	if (!g_bUseOriginalServer && !g_bUseSSL)
+	if (!g_bUseOriginalServer)
 	{
 		// hook GetSSLProtocolName to make Crypt work
 		find = FindPattern(GETSSLPROTOCOLNAME_SIG_CSNZ, GETSSLPROTOCOLNAME_MASK_CSNZ, g_dwEngineBase, g_dwEngineBase + g_dwEngineSize, NULL);
@@ -2638,7 +2747,10 @@ void Hook(HMODULE hEngineModule, HMODULE hFileSystemModule)
 			MessageBox(NULL, "GetSSLProtocolName == NULL!!!", "Error", MB_OK);
 		else
 			InlineHookFromCallOpcode((void*)find, Hook_GetSSLProtocolName, (void*&)g_pfnGetSSLProtocolName, dummy);
+	}
 
+	if (!g_bUseOriginalServer && !g_bUseSSL)
+	{
 		// hook SocketConstructor to create ctx objects
 		find = FindPatternCompat(SOCKETCONSTRUCTOR_SIG_CSNZ, SOCKETCONSTRUCTOR_MASK_CSNZ, SOCKETCONSTRUCTOR_SIG_CSNZ_LATEST, SOCKETCONSTRUCTOR_MASK_CSNZ_LATEST, g_dwEngineBase, g_dwEngineBase + g_dwEngineSize);
 		if (!find)
