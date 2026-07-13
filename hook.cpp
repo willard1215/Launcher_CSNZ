@@ -34,12 +34,13 @@ DWORD g_dwFileSystemSize;
 
 #define DEFAULT_IP "127.0.0.1"
 #define DEFAULT_PORT "30002"
-#define ENABLE_LAUNCHER_CHAT_AUTOLOGIN 0
+#define ENABLE_LAUNCHER_CHAT_AUTOLOGIN 1
 #define ENABLE_GAMEUI_AUTH_UI 0
 
 #define HW_LOGIN_DLG_CTOR_RVA 0x9505A0
 #define HW_LOGIN_DLG_ONCOMMAND_RVA 0x951940
 #define HW_AUTH_MANAGER_AUTH_RVA 0x818B20
+#define HW_AUTH_MANAGER_AUTH_WITH_PASSPORT_RVA 0x818F10
 #define HW_AUTH_STATE_GLOBAL_RVA 0x228C9E4
 #define HW_SOCKET_MANAGER_EVENT_RVA 0
 #define HW_SOCKET_MANAGER_CONNECT_RVA 0
@@ -1827,6 +1828,22 @@ CreateHookClass(bool, HWAuthManager_Auth, char* login, char* password, char* ext
 	return result;
 }
 
+CreateHookClass(bool, HWAuthManager_AuthWithPassport, void* passport)
+{
+	LauncherTrace("HWAuthManager::AuthWithPassport enter this=%p passport=%p cmdlineOverride=%d originalServer=%d",
+		ptr, passport, HasCommandLineLogin() ? 1 : 0, g_bUseOriginalServer ? 1 : 0);
+
+	if (!g_bUseOriginalServer && HasCommandLineLogin())
+	{
+		LauncherTrace("HWAuthManager::AuthWithPassport redirecting to Auth with command line credentials");
+		return Hook_HWAuthManager_Auth(ptr, 0, g_pLogin, g_pPassword, nullptr);
+	}
+
+	bool result = g_pfnHWAuthManager_AuthWithPassport(ptr, passport);
+	LauncherTrace("HWAuthManager::AuthWithPassport leave this=%p result=%d", ptr, result ? 1 : 0);
+	return result;
+}
+
 bool bShowLoginDlg = false;
 void __fastcall GameUI_RunFrame(void* _this)
 {
@@ -2522,6 +2539,12 @@ void Hook(HMODULE hEngineModule, HMODULE hFileSystemModule)
 			LauncherTrace("HWAuthManager::Auth hook failed at %08X", find);
 		else
 			LauncherTrace("HWAuthManager::Auth hooked at %08X old=%p", find, g_pfnHWAuthManager_Auth);
+
+		find = g_dwEngineBase + HW_AUTH_MANAGER_AUTH_WITH_PASSPORT_RVA;
+		if (!InlineHook((void*)find, Hook_HWAuthManager_AuthWithPassport, (void*&)g_pfnHWAuthManager_AuthWithPassport))
+			LauncherTrace("HWAuthManager::AuthWithPassport hook failed at %08X", find);
+		else
+			LauncherTrace("HWAuthManager::AuthWithPassport hooked at %08X old=%p", find, g_pfnHWAuthManager_AuthWithPassport);
 
 		if (HW_SOCKET_MANAGER_EVENT_RVA)
 		{
