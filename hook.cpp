@@ -37,15 +37,15 @@ DWORD g_dwFileSystemSize;
 #define ENABLE_LAUNCHER_CHAT_AUTOLOGIN 0
 #define ENABLE_GAMEUI_AUTH_UI 0
 
-#define HW_LOGIN_DLG_CTOR_RVA 0x94D800
-#define HW_LOGIN_DLG_ONCOMMAND_RVA 0x94EBA0
-#define HW_AUTH_MANAGER_AUTH_RVA 0x8170A0
-#define HW_AUTH_STATE_GLOBAL_RVA 0x2289984
-#define HW_SOCKET_MANAGER_EVENT_RVA 0xA76AF0
-#define HW_SOCKET_MANAGER_CONNECT_RVA 0xA76F00
+#define HW_LOGIN_DLG_CTOR_RVA 0x9505A0
+#define HW_LOGIN_DLG_ONCOMMAND_RVA 0x951940
+#define HW_AUTH_MANAGER_AUTH_RVA 0x818B20
+#define HW_AUTH_STATE_GLOBAL_RVA 0x228C9E4
+#define HW_SOCKET_MANAGER_EVENT_RVA 0
+#define HW_SOCKET_MANAGER_CONNECT_RVA 0
 #define HW_READPACKET_EVENT_CALL_RVA 0xA77290
 #define HW_WSARECV_WRAPPER_RVA 0x3AD960
-#define HW_ALLOC_STRING_RVA 0xA709D0
+#define HW_ALLOC_STRING_RVA 0xA73780
 
 #define SOCKETMANAGER_SIG_CSNZ23 "\x55\x8B\xEC\x6A\x00\x68\x00\x00\x00\x00\x64\xA1\x00\x00\x00\x00\x50\x51\x53\x56\x57\xA1\x00\x00\x00\x00\x33\xC5\x50\x8D\x45\x00\x64\xA3\x00\x00\x00\x00\x8B\xD9\x89\x5D\x00\x8A\x45"
 #define SOCKETMANAGER_MASK_CSNZ23 "xxxx?x????xx????xxxxxx????xxxxx?xx????xxxx?xx"
@@ -1589,6 +1589,23 @@ static void ReadHWTextEntry(void* entry, char* out, int outSize)
 	}
 }
 
+static void SetHWTextEntry(void* entry, const char* text)
+{
+	if (!entry)
+		return;
+	if (!text)
+		text = "";
+
+	__try
+	{
+		(*(void(__thiscall**)(void*, const char*))(*(DWORD*)entry + 0x284))(entry, text);
+	}
+	__except (EXCEPTION_EXECUTE_HANDLER)
+	{
+		LauncherTrace("SetHWTextEntry exception entry=%p textLen=%d", entry, (int)strlen(text));
+	}
+}
+
 static bool HasCommandLineLogin()
 {
 	return g_pLogin[0] != 0 && g_pPassword[0] != 0;
@@ -1636,6 +1653,10 @@ DWORD WINAPI AutoHWLoginThread(LPVOID param)
 
 	__try
 	{
+		void* pLoginTextEntry = *(void**)((DWORD)loginDlg + 0x1B8);
+		void* pPasswordTextEntry = *(void**)((DWORD)loginDlg + 0x1BC);
+		SetHWTextEntry(pLoginTextEntry, g_pLogin);
+		SetHWTextEntry(pPasswordTextEntry, g_pPassword);
 		LauncherTrace("AutoHWLogin invoking Login command: dlg=%p login='%s' passwordLen=%d",
 			loginDlg, g_pLogin, (int)strlen(g_pPassword));
 		g_pfnHWLoginDlg_OnCommand(loginDlg, "Login");
@@ -2502,17 +2523,31 @@ void Hook(HMODULE hEngineModule, HMODULE hFileSystemModule)
 		else
 			LauncherTrace("HWAuthManager::Auth hooked at %08X old=%p", find, g_pfnHWAuthManager_Auth);
 
-		find = g_dwEngineBase + HW_SOCKET_MANAGER_EVENT_RVA;
-		if (!InlineHook((void*)find, Hook_HWSocketManager_Event, (void*&)g_pfnHWSocketManager_Event))
-			LauncherTrace("HWSocketManager::Event hook failed at %08X", find);
+		if (HW_SOCKET_MANAGER_EVENT_RVA)
+		{
+			find = g_dwEngineBase + HW_SOCKET_MANAGER_EVENT_RVA;
+			if (!InlineHook((void*)find, Hook_HWSocketManager_Event, (void*&)g_pfnHWSocketManager_Event))
+				LauncherTrace("HWSocketManager::Event hook failed at %08X", find);
+			else
+				LauncherTrace("HWSocketManager::Event hooked at %08X old=%p", find, g_pfnHWSocketManager_Event);
+		}
 		else
-			LauncherTrace("HWSocketManager::Event hooked at %08X old=%p", find, g_pfnHWSocketManager_Event);
+		{
+			LauncherTrace("HWSocketManager::Event hook skipped: RVA disabled for this hw.dll");
+		}
 
-		find = g_dwEngineBase + HW_SOCKET_MANAGER_CONNECT_RVA;
-		if (!InlineHook((void*)find, Hook_HWSocketManager_Connect, (void*&)g_pfnHWSocketManager_Connect))
-			LauncherTrace("HWSocketManager::Connect hook failed at %08X", find);
+		if (HW_SOCKET_MANAGER_CONNECT_RVA)
+		{
+			find = g_dwEngineBase + HW_SOCKET_MANAGER_CONNECT_RVA;
+			if (!InlineHook((void*)find, Hook_HWSocketManager_Connect, (void*&)g_pfnHWSocketManager_Connect))
+				LauncherTrace("HWSocketManager::Connect hook failed at %08X", find);
+			else
+				LauncherTrace("HWSocketManager::Connect hooked at %08X old=%p", find, g_pfnHWSocketManager_Connect);
+		}
 		else
-			LauncherTrace("HWSocketManager::Connect hooked at %08X old=%p", find, g_pfnHWSocketManager_Connect);
+		{
+			LauncherTrace("HWSocketManager::Connect hook skipped: RVA disabled for this hw.dll");
+		}
 
 		find = g_dwEngineBase + HW_WSARECV_WRAPPER_RVA;
 		if (*(BYTE*)find == 0x55 && *(BYTE*)(find + 1) == 0x8B && *(BYTE*)(find + 2) == 0xEC)
