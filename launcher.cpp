@@ -89,8 +89,25 @@ int CALLBACK WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLi
 	if (szGameStr && !_strnicmp(&szGameStr[6], "czero", 5))
 		CommandLine()->AppendParm("-forcevalve", NULL);
 
-	if (CommandLine()->CheckParm("-lang") == NULL)
-		CommandLine()->AppendParm("-lang", "ko_"); 	// the game won't load without this line
+	const char* pszLanguage = NULL;
+	if (CommandLine()->CheckParm("-lang", &pszLanguage) == NULL)
+	{
+		CommandLine()->AppendParm("-lang", "kr");
+	}
+	else if (pszLanguage && !_stricmp(pszLanguage, "ko_"))
+	{
+		// Current hw.dll recognizes "kr"; "ko_" leaves its locale name empty.
+		CommandLine()->RemoveParm("-lang");
+		CommandLine()->AppendParm("-lang", "kr");
+	}
+
+	const char* pszVGuiLanguage = NULL;
+	if (CommandLine()->CheckParm("-language", &pszVGuiLanguage) == NULL)
+	{
+		// FileSystem_Nar uses -lang for the PAK mount, while VGUI uses this
+		// value when expanding Resource/*_%language%.txt.
+		CommandLine()->AppendParm("-language", "koreana");
+	}
 
 	// 메인루프 진입
 	while (1)

@@ -4,10 +4,11 @@
 #include <locale.h>
 #include <ICommandLine.h>
 #include <IGameUI.h>
+#include <IFileSystem.h>
 #include <VGUI/IPanel.h>
+#include <VGUI/ILocalize.h>
 #include "DediCsv.h"
 #include "ChattingManager.h"
-#include <IFileSystem.h>
 
 #define MAX_ZIP_SIZE	(1024 * 1024 * 16 )
 #include "XZip.h"
@@ -17,7 +18,10 @@
 #include <unordered_map>
 #include "sys.h"
 #include <stdarg.h>
+#include <dbghelp.h>
 #include "../CSNZ_Server/src/thirdparty/SQLiteCpp/sqlite3/sqlite3.h"
+
+#pragma comment(lib, "dbghelp.lib")
 
 HMODULE g_hEngineModule;
 DWORD g_dwEngineBase;
@@ -47,7 +51,11 @@ DWORD g_dwFileSystemSize;
 #define HW_READPACKET_EVENT_CALL_RVA 0xA77290
 #define HW_WSARECV_WRAPPER_RVA 0x3AD960
 #define HW_ALLOC_STRING_RVA 0xA73780
+#define HW_BLACKCIPHER_INIT_RVA 0x88BD50
 
+// Verified against asset/Bin/hw.dll (image base 0x01D00000, 2026-07-16).
+// Signatures marked legacy below are allowed to miss. In this build the old
+// NGClient init pattern collides with a required BlackCipher initialization.
 #define SOCKETMANAGER_SIG_CSNZ23 "\x55\x8B\xEC\x6A\x00\x68\x00\x00\x00\x00\x64\xA1\x00\x00\x00\x00\x50\x51\x53\x56\x57\xA1\x00\x00\x00\x00\x33\xC5\x50\x8D\x45\x00\x64\xA3\x00\x00\x00\x00\x8B\xD9\x89\x5D\x00\x8A\x45"
 #define SOCKETMANAGER_MASK_CSNZ23 "xxxx?x????xx????xxxxxx????xxxxx?xx????xxxx?xx"
 
@@ -162,6 +170,7 @@ public:
 CCSBotManager* g_pBotManager = NULL;
 
 vgui::IPanel* g_pPanel = nullptr;
+vgui::ILocalize* g_pLocalize = nullptr;
 IGameUI* g_pGameUI = nullptr;
 ChattingManager* g_pChattingManager;
 
@@ -202,6 +211,108 @@ void LauncherTrace(const char* fmt, ...)
 
 	fprintf(file, "\n");
 	fclose(file);
+}
+
+static PVOID g_pExceptionLogger = NULL;
+static volatile LONG g_lLoggingException = 0;
+
+static LONG CALLBACK LogUnhandledClientException(PEXCEPTION_POINTERS info)
+{
+	if (!info || !info->ExceptionRecord || !info->ContextRecord)
+		return EXCEPTION_CONTINUE_SEARCH;
+
+	DWORD code = info->ExceptionRecord->ExceptionCode;
+	if (code != EXCEPTION_ILLEGAL_INSTRUCTION &&
+		code != EXCEPTION_ACCESS_VIOLATION &&
+		code != EXCEPTION_STACK_OVERFLOW)
+		return EXCEPTION_CONTINUE_SEARCH;
+	if (InterlockedCompareExchange(&g_lLoggingException, 1, 0) != 0)
+		return EXCEPTION_CONTINUE_SEARCH;
+
+	CONTEXT* ctx = info->ContextRecord;
+	MEMORY_BASIC_INFORMATION mbi = {};
+	HMODULE module = NULL;
+	char modulePath[MAX_PATH] = "<unknown>";
+	if (VirtualQuery((void*)ctx->Eip, &mbi, sizeof(mbi)))
+	{
+		module = (HMODULE)mbi.AllocationBase;
+		GetModuleFileNameA(module, modulePath, sizeof(modulePath));
+	}
+
+	LauncherTrace("CLIENT EXCEPTION code=%08X address=%p module=%s base=%p rva=%08X eax=%08X ebx=%08X ecx=%08X edx=%08X esi=%08X edi=%08X ebp=%08X esp=%08X",
+		code, info->ExceptionRecord->ExceptionAddress, modulePath, module,
+		module ? ctx->Eip - (DWORD)module : 0, ctx->Eax, ctx->Ebx, ctx->Ecx,
+		ctx->Edx, ctx->Esi, ctx->Edi, ctx->Ebp, ctx->Esp);
+	if (code == EXCEPTION_ACCESS_VIOLATION && info->ExceptionRecord->NumberParameters >= 2)
+	{
+		LauncherTrace("CLIENT EXCEPTION access=%s target=%p",
+			info->ExceptionRecord->ExceptionInformation[0] == 0 ? "read" :
+			info->ExceptionRecord->ExceptionInformation[0] == 1 ? "write" : "execute",
+			(void*)info->ExceptionRecord->ExceptionInformation[1]);
+	}
+
+	__try
+	{
+		DWORD* stack = (DWORD*)ctx->Esp;
+		LauncherTrace("CLIENT EXCEPTION stack=%08X %08X %08X %08X %08X %08X %08X %08X %08X %08X %08X %08X",
+			stack[0], stack[1], stack[2], stack[3], stack[4], stack[5],
+			stack[6], stack[7], stack[8], stack[9], stack[10], stack[11]);
+	}
+	__except (EXCEPTION_EXECUTE_HANDLER)
+	{
+		LauncherTrace("CLIENT EXCEPTION stack unreadable");
+	}
+
+	HANDLE process = GetCurrentProcess();
+	if (SymInitialize(process, NULL, TRUE))
+	{
+		STACKFRAME64 frame = {};
+		frame.AddrPC.Offset = ctx->Eip;
+		frame.AddrPC.Mode = AddrModeFlat;
+		frame.AddrFrame.Offset = ctx->Ebp;
+		frame.AddrFrame.Mode = AddrModeFlat;
+		frame.AddrStack.Offset = ctx->Esp;
+		frame.AddrStack.Mode = AddrModeFlat;
+
+		for (int depth = 0; depth < 32; ++depth)
+		{
+			if (depth > 0 && !StackWalk64(IMAGE_FILE_MACHINE_I386, process, GetCurrentThread(),
+				&frame, ctx, NULL, SymFunctionTableAccess64, SymGetModuleBase64, NULL))
+				break;
+			if (!frame.AddrPC.Offset)
+				break;
+
+			DWORD64 address = frame.AddrPC.Offset;
+			DWORD64 symbolDisplacement = 0;
+			char symbolBuffer[sizeof(SYMBOL_INFO) + MAX_SYM_NAME] = {};
+			SYMBOL_INFO* symbol = (SYMBOL_INFO*)symbolBuffer;
+			symbol->SizeOfStruct = sizeof(SYMBOL_INFO);
+			symbol->MaxNameLen = MAX_SYM_NAME;
+
+			MEMORY_BASIC_INFORMATION stackMbi = {};
+			HMODULE stackModule = NULL;
+			char stackModulePath[MAX_PATH] = "<unknown>";
+			if (VirtualQuery((void*)(DWORD)address, &stackMbi, sizeof(stackMbi)))
+			{
+				stackModule = (HMODULE)stackMbi.AllocationBase;
+				GetModuleFileNameA(stackModule, stackModulePath, sizeof(stackModulePath));
+			}
+
+			if (SymFromAddr(process, address, &symbolDisplacement, symbol))
+				LauncherTrace("CLIENT STACK #%02d address=%08X module=%s rva=%08X symbol=%s+%I64X",
+					depth, (DWORD)address, stackModulePath,
+					stackModule ? (DWORD)address - (DWORD)stackModule : 0,
+					symbol->Name, symbolDisplacement);
+			else
+				LauncherTrace("CLIENT STACK #%02d address=%08X module=%s rva=%08X",
+					depth, (DWORD)address, stackModulePath,
+					stackModule ? (DWORD)address - (DWORD)stackModule : 0);
+		}
+		SymCleanup(process);
+	}
+
+	InterlockedExchange(&g_lLoggingException, 0);
+	return EXCEPTION_CONTINUE_SEARCH;
 }
 
 static void FormatHexPreview(char* out, int outSize, const unsigned char* data, int size, int limit = 48)
@@ -2241,6 +2352,57 @@ void CreateDebugConsole()
 	setlocale(LC_ALL, "");
 }
 
+static void TraceLocalizedToken(const char* tokenName)
+{
+	if (!g_pLocalize || !tokenName)
+		return;
+
+	wchar_t* value = g_pLocalize->Find(tokenName);
+	char utf8[1024] = { 0 };
+	if (value)
+		WideCharToMultiByte(CP_UTF8, 0, value, -1, utf8, sizeof(utf8), NULL, NULL);
+
+	LauncherTrace("Localization token='%s' found=%d value='%s'", tokenName,
+		value ? 1 : 0, value ? utf8 : "");
+}
+
+static void TraceAndRepairLocalization(CreateInterfaceFn vgui2_factory)
+{
+	if (!vgui2_factory)
+		return;
+
+		g_pLocalize = (vgui::ILocalize*)CaptureInterface(vgui2_factory,
+			VGUI_LOCALIZE_INTERFACE_VERSION);
+		LauncherTrace("Localization interface=%p", g_pLocalize);
+		if (!g_pLocalize)
+			return;
+
+		const char* localeFiles[] = {
+			"Resource/valve_koreana.txt",
+			"Resource/cstrike_koreana.txt",
+			"Resource/cso_koreana.txt",
+			"Resource/vgui_koreana.txt",
+			"Resource/gameui_koreana.txt",
+			"Resource/platform_koreana.txt"
+		};
+
+		LauncherTrace("Localization loading Korean resource files");
+		for (int i = 0; i < sizeof(localeFiles) / sizeof(localeFiles[0]); ++i)
+		{
+			FileHandle_t file = g_pFileSystem->Open(localeFiles[i], "rb", 0);
+			LauncherTrace("Localization filesystem probe '%s' handle=%p size=%u", localeFiles[i], file,
+				file ? g_pFileSystem->Size(file) : 0);
+			if (file)
+				g_pFileSystem->Close(file);
+
+			bool added = g_pLocalize->AddFile(g_pFileSystem, localeFiles[i]);
+			LauncherTrace("Localization AddFile '%s' result=%d", localeFiles[i], added ? 1 : 0);
+		}
+
+		TraceLocalizedToken("CSO_ItemInventoryTitle");
+		TraceLocalizedToken("#CSO_ItemInventoryTitle");
+}
+
 DWORD WINAPI HookThread(LPVOID lpThreadParameter)
 {
 	LauncherTrace("HookThread start");
@@ -2274,6 +2436,8 @@ DWORD WINAPI HookThread(LPVOID lpThreadParameter)
 		g_pPanel = (vgui::IPanel*)(CaptureInterface(vgui2_factory, VGUI_PANEL_INTERFACE_VERSION));
 		LauncherTrace("HookThread factories: gameui=%p vgui2=%p interfaces: gameui=%p panel=%p",
 			gameui_factory, vgui2_factory, g_pGameUI, g_pPanel);
+		// ILocalize is not thread-safe while gameui is constructing its panels.
+		// Loading files from this worker thread races that initialization.
 		VFTHook(g_pGameUI, 0, 6, GameUI_RunFrame, (void*&)g_pfnGameUI_RunFrame);
 		LauncherTrace("HookThread GameUI_RunFrame old=%p", g_pfnGameUI_RunFrame);
 
@@ -2447,6 +2611,8 @@ void Init(HMODULE hEngineModule, HMODULE hFileSystemModule)
 void Hook(HMODULE hEngineModule, HMODULE hFileSystemModule)
 {
 	Init(hEngineModule, hFileSystemModule);
+	if (g_bDumpAll && !g_pExceptionLogger)
+		g_pExceptionLogger = AddVectoredExceptionHandler(1, LogUnhandledClientException);
 
 	DWORD find = NULL;
 	void* dummy = NULL;
@@ -2457,7 +2623,13 @@ void Hook(HMODULE hEngineModule, HMODULE hFileSystemModule)
 		if (!find)
 			LauncherTrace("NGClient_Init == NULL!!!");
 		else
-			InlineHookFromCallOpcode((void*)find, NGClient_Return1, dummy, dummy);
+		{
+			DWORD callTarget = *(BYTE*)find == 0xE8 ? find + 5 + *(DWORD*)(find + 1) : 0;
+			if (callTarget == g_dwEngineBase + HW_BLACKCIPHER_INIT_RVA)
+				LauncherTrace("Legacy NGClient_Init signature rejected: call at %08X targets required BlackCipher_Init %08X", find, callTarget);
+			else
+				InlineHookFromCallOpcode((void*)find, NGClient_Return1, dummy, dummy);
+		}
 
 		find = FindPattern(NGCLIENT_QUIT_SIG_CSNZ, NGCLIENT_QUIT_MASK_CSNZ, g_dwEngineBase, g_dwEngineBase + g_dwEngineSize, NULL);
 		if (!find)
@@ -2612,30 +2784,10 @@ void Hook(HMODULE hEngineModule, HMODULE hFileSystemModule)
 		*/
 
 		{
-			DWORD pushStr = 0;
-			DWORD patchAddr = 0;
-
-			// NOP dedi check on Zombie Skills
-			pushStr = FindPush(g_dwEngineBase, g_dwEngineBase + g_dwEngineSize, (PCHAR)("resource/zombi/ZombieSkillProperty_Dedi/ZombieSkillProperty_Crazy.csv"));
-			if (!pushStr)
-				LauncherTrace("ZombieSkillProperty_Patch == NULL!!!");
-			else
-			{
-				patchAddr = pushStr - 0x23;
-				BYTE patch[] = { 0x90, 0x90, 0x90, 0x90, 0x90, 0x90 };
-				WriteMemory((void*)patchAddr, (BYTE*)patch, sizeof(patch));
-			}
-
-			// NOP dedi check on Fire Bomb
-			pushStr = FindPush(g_dwEngineBase, g_dwEngineBase + g_dwEngineSize, (PCHAR)("resource/zombi/FireBombOption_Dedi.csv"));
-			if (!pushStr)
-				LauncherTrace("FireBombOption_Patch == NULL!!!");
-			else
-			{
-				patchAddr = pushStr - 0x8;
-				BYTE patch2[] = { 0x90, 0x90, 0x90, 0x90, 0x90, 0x90 };
-				WriteMemory((void*)patchAddr, (BYTE*)patch2, sizeof(patch2));
-			}
+			// The old fixed-distance dedi patches overlap function prologues in
+			// this hw.dll. In particular, pushStr - 0x23 splits MOV EBX,ECX and
+			// leaves 0xD9 as an instruction, causing STATUS_ILLEGAL_INSTRUCTION.
+			LauncherTrace("Legacy ZombieSkillProperty/FireBomb dedi patches disabled for this hw.dll");
 
 			find = FindPattern(CREATESTRINGTABLE_SIG_CSNZ, CREATESTRINGTABLE_MASK_CSNZ, g_dwEngineBase, g_dwEngineBase + g_dwEngineSize, NULL);
 			if (!find)
@@ -2669,7 +2821,7 @@ void Hook(HMODULE hEngineModule, HMODULE hFileSystemModule)
 		// hook Pbuf_AddText to allow any cvar or cmd input from console
 		g_pEngine->Pbuf_AddText = Pbuf_AddText;
 
-	if (g_bDumpMetadata || g_bWriteMetadata || g_bIgnoreMetadata || !g_bUseOriginalServer)
+	if (g_bDumpMetadata || g_bWriteMetadata || g_bIgnoreMetadata || g_bDumpAll)
 	{
 		find = FindPattern(PACKET_METADATA_PARSE_SIG_CSNZ, PACKET_METADATA_PARSE_MASK_CSNZ, g_dwEngineBase, g_dwEngineBase + g_dwEngineSize, NULL);
 		if (!find)
@@ -2683,7 +2835,7 @@ void Hook(HMODULE hEngineModule, HMODULE hFileSystemModule)
 		}
 	}
 
-	if (g_bDumpQuest || !g_bUseOriginalServer)
+	if (g_bDumpQuest || g_bDumpAll)
 	{
 		find = FindPattern(PACKET_QUEST_PARSE_SIG_CSNZ, PACKET_QUEST_PARSE_MASK_CSNZ, g_dwEngineBase, g_dwEngineBase + g_dwEngineSize, NULL);
 		if (!find)
@@ -2695,7 +2847,7 @@ void Hook(HMODULE hEngineModule, HMODULE hFileSystemModule)
 		}
 	}
 
-	if (g_bDumpUMsg || !g_bUseOriginalServer)
+	if (g_bDumpUMsg || g_bDumpAll)
 	{
 		find = FindPattern(PACKET_UMSG_PARSE_SIG_CSNZ, PACKET_UMSG_PARSE_MASK_CSNZ, g_dwEngineBase, g_dwEngineBase + g_dwEngineSize, NULL);
 		if (!find)
@@ -2707,7 +2859,7 @@ void Hook(HMODULE hEngineModule, HMODULE hFileSystemModule)
 		}
 	}
 
-	if (g_bDumpAlarm || !g_bUseOriginalServer)
+	if (g_bDumpAlarm || g_bDumpAll)
 	{
 		find = FindPattern(PACKET_ALARM_PARSE_SIG_CSNZ, PACKET_ALARM_PARSE_MASK_CSNZ, g_dwEngineBase, g_dwEngineBase + g_dwEngineSize, NULL);
 		if (!find)
@@ -2719,7 +2871,7 @@ void Hook(HMODULE hEngineModule, HMODULE hFileSystemModule)
 		}
 	}
 
-	if (g_bDumpItem || !g_bUseOriginalServer)
+	if (g_bDumpItem || g_bDumpAll)
 	{
 		find = FindPattern(PACKET_ITEM_PARSE_SIG_CSNZ, PACKET_ITEM_PARSE_MASK_CSNZ, g_dwEngineBase, g_dwEngineBase + g_dwEngineSize, NULL);
 		if (!find)
@@ -2731,7 +2883,7 @@ void Hook(HMODULE hEngineModule, HMODULE hFileSystemModule)
 		}
 	}
 
-	if (g_bDumpCrypt || !g_bUseOriginalServer)
+	if (g_bDumpCrypt || g_bDumpAll)
 	{
 		find = FindPattern(PACKET_CRYPT_PARSE_SIG_CSNZ, PACKET_CRYPT_PARSE_MASK_CSNZ, g_dwEngineBase, g_dwEngineBase + g_dwEngineSize, NULL);
 		if (!find)
@@ -2743,7 +2895,7 @@ void Hook(HMODULE hEngineModule, HMODULE hFileSystemModule)
 		}
 	}
 
-	if (g_bDumpAll || !g_bUseOriginalServer)
+	if (g_bDumpAll)
 	{
 		find = FindPattern(READPACKET_SIG_CSNZ, READPACKET_MASK_CSNZ, g_dwEngineBase, g_dwEngineBase + g_dwEngineSize, NULL);
 		if (!find)
@@ -2832,5 +2984,10 @@ void Hook(HMODULE hEngineModule, HMODULE hFileSystemModule)
 
 void Unhook()
 {
+	if (g_pExceptionLogger)
+	{
+		RemoveVectoredExceptionHandler(g_pExceptionLogger);
+		g_pExceptionLogger = NULL;
+	}
 	FreeAllHook();
 }

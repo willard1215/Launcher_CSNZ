@@ -2,6 +2,44 @@
 
 Last updated: 2026-07-11
 
+## 2026-07-16 Latest hw.dll Signature Audit
+
+- Rechecked the signature block in `hook.cpp` against
+  `asset/Bin/hw.dll` in Ghidra (image base `0x01D00000`).
+- Found the client shutdown root cause:
+  - `NGCLIENT_INIT_SIG_CSNZ` still has one match in the latest DLL.
+  - That match is not NGClient initialization. It is the engine startup call
+    to `BlackCipher_Init` at RVA `0x7BC0BF`, targeting RVA `0x88BD50`.
+  - Replacing that call with `NGClient_Return1` skipped BlackCipher queue and
+    critical-section initialization. The frame loop later entered the
+    uninitialized critical section and terminated with `0xC0000005`.
+- The launcher now resolves the matched `CALL` target and refuses the legacy
+  NGClient hook when it targets the required BlackCipher initializer.
+- The old fixed-distance ZombieSkillProperty and FireBomb patches remain
+  disabled because they overlap function instructions in this DLL.
+- Latest-DLL semantic checks completed:
+  - Socket manager constructor: valid, RVA `0xA79450`.
+  - Server connect call: valid, RVA `0x96BD4A`, target RVA `0xA79CB0`.
+  - HolePunch get/set server info: valid, RVAs `0x7C9430` / `0x7C9D70`.
+  - CreateStringTable: valid, RVA `0xA7E980`; its parser call remains at
+    function offset `+0x71`.
+  - Latest LoadJson/file-buffer function: valid, RVA `0x8D5830`.
+  - LogToErrorLog, ReadPacket call, GetSSLProtocolName call, and latest socket
+    constructor call were all confirmed at their matched locations.
+  - NGClient quit, packet hack send/parse, alarm parser, bot manager pointer,
+    and CSOMainPanel pointer signatures do not match this DLL and remain
+    optional legacy paths.
+- Full default runtime test (no metadata filter/minimal mode):
+  - Release launcher built and deployed to `asset/Bin/CSOLauncher.exe`.
+  - Client and server were both alive after 60 seconds.
+  - Server reached Login(3), sent the full initial metadata set, received the
+    crypt acknowledgement, joined channel `1-1`, and exchanged Lobby(153) and
+    GameMatchRoomList(151) traffic.
+  - Test log: `CSNZ_Server/bin/full_rootfix_20260716_114756.stdout.txt`.
+- The vectored exception stack logger is now enabled only by `-dumpall`, since
+  BlackCipher and NGClient use handled first-chance exceptions during normal
+  startup.
+
 ## Current Goal
 
 Run the latest CSNZ launcher against the local `CSNZ_Server` without relying on the GUI login flow, then trace the latest `hw.dll` login/bootstrap packet flow until lobby entry works.
@@ -97,7 +135,7 @@ Run the latest CSNZ launcher against the local `CSNZ_Server` without relying on 
 Run the launcher from `asset\Bin`:
 
 ```powershell
-Start-Process -FilePath 'D:\project\CSONLINE\asset\Bin\CSOLauncher.exe' -WorkingDirectory 'D:\project\CSONLINE\asset\Bin' -ArgumentList '-game CSOLauncher -lang ko_ -login localuser -password localpass1'
+Start-Process -FilePath 'D:\project\CSONLINE\asset\Bin\CSOLauncher.exe' -WorkingDirectory 'D:\project\CSONLINE\asset\Bin' -ArgumentList '-game cstrike-online -login localuser -password localpass1'
 ```
 
 Check:
@@ -116,7 +154,63 @@ Get-Content -LiteralPath 'D:\project\CSONLINE\asset\Bin\LauncherTrace.log' -Tail
 Official metadata dump path, when running a decrypting client session:
 
 ```powershell
-CSOLauncher.exe -game CSOLauncher -lang ko_ -dumpmetadata
+CSOLauncher.exe -game cstrike-online -lang kr -dumpmetadata
 ```
 
 Dumped ZIP payloads are written to `asset\Bin\MetadataDump`.
+
+## 2026-07-16 Current Locale And GUI Verification
+
+- Asset `hw.dll` language parsing at `0x0264ED20` recognizes `kr`; `ko_` is
+  absent from its language table and leaves the locale name empty.
+- The launcher now defaults to `-lang kr` and normalizes an explicitly supplied
+  legacy `-lang ko_` to `kr` before loading `hw.dll`.
+- A user-desktop launch created visible window `0x290B5C` titled
+  `Counter-Strike Online PID(26508)`. `CVideoMode_OpenGL display activate`,
+  the login dialog constructor, and `GameUI_RunFrame` all ran successfully.
+- Asset `hw.dll` uses `-lang kr` to mount `/lstrike/locale_kr/`. Adding
+  `-language koreana` alone did not populate the current VGUI localization
+  table; the earlier Korean HUD screenshot was texture content and was not
+  valid evidence of localization.
+- Runtime inspection through `VGUI_Localize003` proved that
+  `CSO_ItemInventoryTitle` was absent even though
+  `Resource/cso_koreana.txt` could be opened. The launcher now explicitly
+  loads the six Korean Valve/CSO localization files after `gameui.dll` loads
+  and before its first frame.
+- All six `AddFile` calls returned success. A subsequent token lookup returned
+  `CSO_ItemInventoryTitle = 인벤토리`, while the client remained responsive
+  through login and lobby entry.
+
+## 2026-07-16 Final Main UI And Locale Status
+
+This section supersedes the localization conclusion immediately above.
+
+- The latest integrated run reaches login, UDP bootstrap, `Lobby(153)`, and
+  `GameMatchRoomList(151)`. The main lobby UI is therefore no longer blocked
+  by missing lobby or room-list initialization packets.
+- An empty room list is currently expected because no dedicated server has
+  successfully registered and no room has been created.
+- `-lang kr` remains the correct asset-engine language option. `ko_` is not a
+  valid language-table entry in the loaded `hw.dll`.
+- Loading the six localization files from `HookThread` is not safe. Although
+  each `AddFile` call can return success and a token can briefly resolve, the
+  call races `gameui.dll` panel construction. Depending on timing it either
+  leaves `#CSO_*` placeholders or causes an access violation.
+- The worker-thread localization repair call is now disabled. The automated
+  lobby run remained responsive after it was disabled, and the reported
+  reference-error behavior was not reproduced in that stable run.
+- The remaining localization fix must run on the game/main thread at the
+  original localization initialization point. Before enabling it, map the
+  latest `hw.dll`/`gameui.dll` call site and preserve the engine's original
+  file-load order.
+- `TraceAndRepairLocalization` remains only as diagnostic/reference code; it
+  is not part of the active startup path.
+
+### Remaining Launcher Work
+
+1. Hook or extend the original main-thread localization initialization and
+   verify Korean tokens across login, inventory, lobby, and room panels.
+2. Retest the client after HLDS can load its dedicated data and register with
+   the master server.
+3. Capture a crash stack if the `0x00A952CD`-style reference error returns;
+   the current stable run did not provide a reproducible faulting stack.
