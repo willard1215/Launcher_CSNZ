@@ -1,6 +1,6 @@
 # Launcher_CSNZ Progress
 
-Last updated: 2026-07-11
+Last updated: 2026-07-16
 
 ## 2026-07-16 Latest hw.dll Signature Audit
 
@@ -214,3 +214,172 @@ This section supersedes the localization conclusion immediately above.
    the master server.
 3. Capture a crash stack if the `0x00A952CD`-style reference error returns;
    the current stable run did not provide a reproducible faulting stack.
+
+## 2026-07-16 Ghidra Main-Thread Localization Hook
+
+- Imported and analyzed the current `GameUI.dll` beside `hw.dll` in the
+  `Ghidra_CSO` project.
+- Mapped the relevant `hw.dll` startup functions and saved names/comments in
+  Ghidra:
+  - `0x0232D070` `BaseUI_LoadGameUIAndInterfaces`
+  - `0x0232D850` `BaseUI_Start`
+  - `0x028311A0` `VGUI_InitializeInterfaces`
+  - `0x02831550` `VGUI_GetLocalize`
+  - `0x02831500` `VGUI_GetFileSystem`
+- `BaseUI_Start` is the original main-thread localization site. It loads the
+  six `valve/cstrike/cso/vgui/gameui/platform` localization files before panel
+  creation and before `GameUI007::Initialize`.
+- Locale IDs `2/3/4/5/7/8/9` have explicit language-file branches. The Korean
+  path falls through to `Resource/*_%language%.txt`, which explains why
+  `-lang kr` mounts the assets but does not by itself guarantee populated VGUI
+  tokens.
+- Added a guarded inline hook at `hw.dll` RVA `0x62D850`. It validates the
+  current five-byte prologue, then preloads the six explicit Korean files on
+  the engine/main thread immediately before the original `BaseUI_Start`.
+- The worker-thread localization call remains disabled. The new hook reuses
+  `TraceAndRepairLocalization` only at the mapped safe point and resets its
+  one-shot guard if the engine restarts.
+- Release x86 build succeeded and produced `Release/CSOLauncher.exe`; only the
+  repository's existing code-page/signedness warnings remain.
+- Live validation completed with the Release x86 artifact copied to
+  `Counter-Strike Online/Bin/CSOLauncher.exe` (matching SHA-256
+  `6F2BA880FE9064868B64A6504E71835EA72ADF1AC3B95386AB6D352CDE500554`).
+- Three launches reached the mapped `BaseUI_Start` safe point. Every run logged
+  matching enter/leave lines, all six Korean files returned `AddFile=1`, and
+  both `CSO_ItemInventoryTitle` token lookups returned non-null values.
+- The localization hook is not the later client-exit source. The default login
+  sample replay sends packet index 134 as `GuideQuest(120)`, 1720 bytes; the
+  latest client reports repeated `PacketReader Error` entries for that payload
+  and exits roughly four seconds after bootstrap.
+- Isolated server run with `CSNZ_LOGIN_SAMPLE_MAX_INDEX=133` and
+  `CSNZ_ASSET_MIN_METADATA=1` excluded that payload. The deployed launcher
+  remained responsive and connected for more than 50 seconds, with one logged
+  in user on the server. Remaining parser warnings concern legacy packet 157
+  and are independent of localization.
+- `CSNZ_Server` now defaults the sample replay ceiling to index 133 while
+  retaining `CSNZ_LOGIN_SAMPLE_MAX_INDEX` as an explicit diagnostic override.
+  After rebuilding the server, a run without that override confirmed range
+  `6..133`, no outbound `GuideQuest(120)` payload, and a responsive client for
+  more than one minute. Server SHA-256:
+  `196C98465D3091054FA17A236527B5C7A9EB4219D706085619FB6BFD0CDAAA01`.
+- GUI automation was not used for this validation. Evidence came from process
+  health plus `LauncherTrace.log`, `Error.log`, and the server connection log.
+
+## 2026-07-16 Runtime Error Follow-up
+
+- Corrected the earlier live-test conclusion: `Responding=True` was not enough
+  to call the run successful because a modal runtime-error path can leave the
+  process responsive.
+- The failing run contained 154 `PacketReader Error` entries for
+  `UserUpdateInfo(157)` subtype `173`. They came from captured login sample
+  index 79 (`Packet_79_ID_157_471.bin`), not from the localization hook.
+- `CSNZ_Server` now:
+  - skips captured sample index 79 while retaining the short compatible 157
+    samples at indices 117/118;
+  - skips its generated legacy full `UserUpdateInfo(157)` for latest clients.
+- Rebuilt server and reran the deployed launcher. The clean run replayed 127
+  packets over range `6..133`, logged zero `PacketReader Error` entries, kept
+  one connected/logged-in user, and remained responsive for over one minute.
+- `Error.log` still reports 197 `no baseWeapon` entries during local weapon
+  data initialization. They precede login-sample processing, produced no
+  runtime/abort/assert text, and are tracked separately from the resolved 157
+  runtime error.
+
+## 2026-07-16 Ghidra DLL Cross-check
+
+- Imported and auto-analyzed the current `client.dll` and `mp.dll` in the
+  existing `Ghidra_CSO` project alongside `hw.dll`.
+- Confirmed matching exported weapon factories in both game modules by
+  creating and decompiling the `weapon_laserfist`, `weapon_laserfistex`, and
+  `weapon_ak47` entry points. The client/server object sizes differ where
+  expected, but the corresponding factories and class initialization paths
+  are present in both DLLs.
+- Located the `no baseWeapon : {}` reference in `hw.dll` at `0x02C566D4` and
+  its only caller, `FUN_02565DA0`. The function builds a weapon-property table,
+  resolves a derived record's base name only against records already added,
+  and logs the warning when that lookup fails. This runs during local engine
+  weapon initialization before game-server login and is not the packet-157
+  runtime error.
+- Recovered the `Packet_UserUpdateInfo` RTTI/vtable at `0x02C7A0E4`. Its parse
+  virtual is `FUN_026A1840`, which reads a four-byte packet field and delegates
+  to `FUN_026BD6C0` with mode `2`.
+- `FUN_026BD6C0` first consumes an eight-byte/64-bit presence mask and then
+  reads a variable set of fields selected by that mask. This confirms that a
+  generated fixed-layout 471-byte packet is not a safe replacement for the
+  captured wire format. Keeping the compatible short captures and excluding
+  captured sample 79 plus the generated legacy full packet matches the actual
+  client parser.
+- Recovered the `Packet_Metadata` vtable at `0x02C79518`; its parser is
+  `FUN_02677B30`, a subtype switch covering the streamed metadata records seen
+  in `Error.log`.
+
+## 2026-07-16 Clean Build and Integrated Runtime Test
+
+- Rebuilt `Launcher_CSNZ` as Release x86 with zero errors and zero warnings.
+  The artifact and the copy deployed under `Counter-Strike Online` have the
+  same SHA-256:
+  `6F2BA880FE9064868B64A6504E71835EA72ADF1AC3B95386AB6D352CDE500554`.
+- The old server CMake cache referenced another source path and an unavailable
+  Windows SDK. Generated a clean Win32 build tree with the installed SDK and
+  rebuilt `CSNZ_Server.exe` successfully. SHA-256:
+  `289C74C7779B7940ED14E54C4947903A2314E14E10763C5429D97490F05D6F4A`.
+- An initial server smoke test was launched from `bin/Release` and produced a
+  C++ exception while opening relative `Data/*.csv` files. Ghidra analysis of
+  the new executable identified the relative-file loader; starting it from
+  `bin` is the required runtime layout. This was a test working-directory
+  error, not a new server-code fault.
+- Ran the corrected server plus the normally windowed deployed launcher for
+  60 seconds without GUI automation. The client connected to TCP port 30002,
+  authentication succeeded, and the mapped `BaseUI_Start` hook executed.
+- This first conclusion was incomplete: it did not launch the deployed
+  launcher with `-login localuser -password localpass1`, so later checks showed
+  the login metadata path had not actually been exercised.
+
+## 2026-07-16 Runtime Metadata ID And Lobby Fix
+
+- Re-ran the deployed `Counter-Strike Online/Bin/CSOLauncher.exe` with explicit
+  local login arguments and reproduced the post-login fault:
+  `hw.dll` Application Error events at offset `0x0097727c` when metadata was
+  sent with latest table IDs.
+- Used `CSNZ_Server/Packets_sampel` as the live Steam packet reference. Those
+  `ID_91` metadata packets use legacy/wire IDs while carrying the current
+  payload layouts, e.g. `weaponparts.csv` as id `17` and
+  `ZBCompetitive.json` as id `48`.
+- `weaponparts.csv` and `ZBCompetitive.json` both parsed and remained stable
+  when sent with `CSNZ_METADATA_IDSET=legacy`. The server now defaults to that
+  live wire-ID mapping; `CSNZ_METADATA_IDSET=latest` remains available as an
+  explicit diagnostic override.
+- Kept the latest-client guard that skips the legacy full
+  `UserUpdateInfo(157)` regardless of metadata ID set, so switching metadata
+  IDs does not re-enable the unsafe generated full 157 packet.
+- Removed the legacy `GameMatch(99)` startup bootstrap from the latest login
+  path and reduced `Lobby(153)` join to an empty latest-safe user list. This
+  removed the remaining `PacketReader Error - curpacketID : 153[0], len : 4`.
+- Final integrated run used the rebuilt server and deployed launcher with
+  `-game cstrike-online -lang kr -login localuser -password localpass1`.
+  It sent 23 metadata records, reached local login bootstrap, stayed connected
+  for 60 seconds, and produced:
+  `crashes=0`, `packetReader=0`, `runtimeLike=0`.
+- Rebuilt the server again after the lobby fix; latest
+  `CSNZ_Server/bin/Release/CSNZ_Server.exe` SHA-256 is
+  `1EA07323BCED5A4D3191D4E186D997B77A3E520D73312ECAC7267D3EDA691ED4`.
+  A fresh 60-second integrated run with the same deployed launcher and explicit
+  login args stayed connected and produced:
+  `crashes=0`, `meta=28`, `packetReader=0`, `runtimeLike=0`,
+  `skip99=1`, `lobbySafe=1`.
+- Follow-up metadata cleanup now mirrors the live Steam stream more closely:
+  the server sends four live hash probes for wire ids `32..35`, uses a
+  64000-byte metadata chunk default, loads/sends `voxel/voxel_list.csv`, and
+  stops login sample replay at packet index `127` by default because packets
+  `128..131` are the large metadata refresh now generated by the server.
+- Final no-override integrated run used `CSNZ_Server.exe` SHA-256
+  `4783C988E9A723E8610CAC9BBCED6E852985BCB403C871F25F8EA756265355AD`.
+  The deployed launcher stayed connected for 60 seconds with replay
+  `range=6..127`, `hashProbe=4`, `chunk64000=1`, and exactly one parsed copy
+  each of `resource/item.csv`, `voxel/voxel_list.csv`, and
+  `resource/codis/codisdata.cso`. Result:
+  `crashes=0`, `packetReader=0`, `runtimeLike=0`.
+- The log interval still contains 197 `no baseWeapon` warnings from local
+  weapon-table initialization. Ghidra analysis already tied these to
+  `hw.dll` weapon-property base lookup order, not to the resolved post-login
+  runtime errors.

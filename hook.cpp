@@ -46,6 +46,7 @@ DWORD g_dwFileSystemSize;
 #define HW_AUTH_MANAGER_AUTH_RVA 0x818B20
 #define HW_AUTH_MANAGER_AUTH_WITH_PASSPORT_RVA 0x818F10
 #define HW_AUTH_STATE_GLOBAL_RVA 0x228C9E4
+#define HW_BASEUI_START_RVA 0x62D850
 #define HW_SOCKET_MANAGER_EVENT_RVA 0
 #define HW_SOCKET_MANAGER_CONNECT_RVA 0
 #define HW_READPACKET_EVENT_CALL_RVA 0xA77290
@@ -178,6 +179,8 @@ WNDPROC oWndProc;
 HWND hWnd;
 
 void(__thiscall* g_pfnGameUI_RunFrame)(void* _this);
+void(__thiscall* g_pfnBaseUI_Start)(void* _this, void* engineFuncs, int interfaceVersion);
+static volatile LONG g_lMainThreadLocalizationLoaded = 0;
 
 typedef void* (__thiscall* tPanel_FindChildByName)(void* _this, const char* name, bool recurseDown);
 tPanel_FindChildByName g_pfnPanel_FindChildByName;
@@ -2403,6 +2406,21 @@ static void TraceAndRepairLocalization(CreateInterfaceFn vgui2_factory)
 		TraceLocalizedToken("#CSO_ItemInventoryTitle");
 }
 
+static void __fastcall Hook_BaseUI_Start(void* _this, int, void* engineFuncs, int interfaceVersion)
+{
+	// BaseUI::Start runs on the engine/main thread.  The original function loads
+	// localization files before GameUI007::Initialize and panel construction, so
+	// preload the Korean files at the same safe point instead of HookThread.
+	if (InterlockedCompareExchange(&g_lMainThreadLocalizationLoaded, 1, 0) == 0)
+	{
+		LauncherTrace("BaseUI::Start main-thread localization preload enter");
+		TraceAndRepairLocalization(CaptureFactory("vgui2.dll"));
+		LauncherTrace("BaseUI::Start main-thread localization preload leave");
+	}
+
+	g_pfnBaseUI_Start(_this, engineFuncs, interfaceVersion);
+}
+
 DWORD WINAPI HookThread(LPVOID lpThreadParameter)
 {
 	LauncherTrace("HookThread start");
@@ -2529,6 +2547,7 @@ void Init(HMODULE hEngineModule, HMODULE hFileSystemModule)
 	g_hEngineModule = hEngineModule;
 	g_dwEngineBase = GetModuleBase(g_hEngineModule);
 	g_dwEngineSize = GetModuleSize(g_hEngineModule);
+	InterlockedExchange(&g_lMainThreadLocalizationLoaded, 0);
 
 	g_dwFileSystemBase = GetModuleBase(hFileSystemModule);
 	g_dwFileSystemSize = GetModuleSize(hFileSystemModule);
@@ -2670,6 +2689,15 @@ void Hook(HMODULE hEngineModule, HMODULE hFileSystemModule)
 
 	if (!g_bUseOriginalServer)
 	{
+		find = g_dwEngineBase + HW_BASEUI_START_RVA;
+		const BYTE baseUIStartPrologue[] = { 0x55, 0x8B, 0xEC, 0x6A, 0xFF };
+		if (memcmp((void*)find, baseUIStartPrologue, sizeof(baseUIStartPrologue)) != 0)
+			LauncherTrace("BaseUI::Start prologue mismatch at %08X; localization hook skipped", find);
+		else if (!InlineHook((void*)find, Hook_BaseUI_Start, (void*&)g_pfnBaseUI_Start))
+			LauncherTrace("BaseUI::Start localization hook failed at %08X", find);
+		else
+			LauncherTrace("BaseUI::Start localization hook installed at %08X old=%p", find, g_pfnBaseUI_Start);
+
 		find = FindPattern(SOCKETMANAGER_SIG_CSNZ23, SOCKETMANAGER_MASK_CSNZ23, g_dwEngineBase, g_dwEngineBase + g_dwEngineSize, NULL);
 		if (!find)
 			MessageBox(NULL, "SocketManagerConstructor == NULL!!!", "Error", MB_OK);
