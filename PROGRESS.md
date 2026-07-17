@@ -383,3 +383,12 @@ This section supersedes the localization conclusion immediately above.
   weapon-table initialization. Ghidra analysis already tied these to
   `hw.dll` weapon-property base lookup order, not to the resolved post-login
   runtime errors.
+
+### 2026-07-17 resource lifetime audit
+
+- Released temporary CSV/JSON buffers after the synchronous engine parsers
+  consume them.
+- Closed the hook, automatic-login, and manual read-pump thread handles after
+  successful creation.
+- Released the temporary command-line copy created by `CreateCmdLine`.
+- Win32 Release build succeeded: `Release/CSOLauncher.exe`.

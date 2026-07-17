@@ -695,7 +695,7 @@ CreateHookClass(int, HWSocketManager_Connect, unsigned long ip, unsigned short p
 		DumpHWSocketManagerHandlers(ptr);
 		if (InterlockedCompareExchange(&g_lManualReadPumpStarted, 1, 0) == 0)
 		{
-			CreateThread(NULL, 0, [](LPVOID) -> DWORD
+			HANDLE readPumpThread = CreateThread(NULL, 0, [](LPVOID) -> DWORD
 			{
 				Sleep(2500);
 				for (int i = 0; i < 120; i++)
@@ -720,6 +720,10 @@ CreateHookClass(int, HWSocketManager_Connect, unsigned long ip, unsigned short p
 				InterlockedExchange(&g_lManualReadPumpStarted, 0);
 				return 0;
 			}, NULL, 0, NULL);
+			if (readPumpThread)
+				CloseHandle(readPumpThread);
+			else
+				InterlockedExchange(&g_lManualReadPumpStarted, 0);
 		}
 	}
 	return result;
@@ -894,6 +898,7 @@ bool LoadCsv(int* _this, const char* filename, unsigned char* defaultBuf, int de
 {
 	unsigned char* buffer = NULL;
 	long size = 0;
+	bool ownsBuffer = false;
 
 	if (g_bLoadDediCsvFromFile)
 	{
@@ -915,7 +920,10 @@ bool LoadCsv(int* _this, const char* filename, unsigned char* defaultBuf, int de
 		{
 			buffer = (unsigned char*)malloc(size);
 			if (buffer)
+			{
+				ownsBuffer = true;
 				fread(buffer, 1, size, file);
+			}
 			else
 				printf("LoadCsv: %s failed to load from file (malloc failed), loading from filesystem\n", filename);
 		}
@@ -941,7 +949,10 @@ LoadFileSystem:
 	{
 		buffer = (unsigned char*)malloc(size);
 		if (buffer)
+		{
+			ownsBuffer = true;
 			g_pFileSystem->Read(buffer, size, fh);
+		}
 		else
 			printf("LoadCsv: %s failed to load from filesystem (malloc failed), loading hardcoded values\n", filename);
 	}
@@ -959,6 +970,8 @@ LoadDefaultBuf:
 
 SetBuffer:
 	g_pfnParseCSV(_this, buffer, size);
+	if (ownsBuffer)
+		free(buffer);
 
 	bool result = 0;
 	if (_this[2])
@@ -1003,6 +1016,7 @@ bool LoadJson(std::string* filename, std::string* oriBuf, unsigned char* default
 {
 	unsigned char* buffer = NULL;
 	long size = 0;
+	bool ownsBuffer = false;
 
 	if (g_bLoadDediCsvFromFile)
 	{
@@ -1024,7 +1038,10 @@ bool LoadJson(std::string* filename, std::string* oriBuf, unsigned char* default
 		{
 			buffer = (unsigned char*)malloc(size);
 			if (buffer)
+			{
+				ownsBuffer = true;
 				fread(buffer, 1, size, file);
+			}
 			else
 				printf("LoadJson: %s failed to load from file (malloc failed), loading from filesystem\n", filename->c_str());
 		}
@@ -1050,7 +1067,10 @@ LoadFileSystem:
 	{
 		buffer = (unsigned char*)malloc(size);
 		if (buffer)
+		{
+			ownsBuffer = true;
 			g_pFileSystem->Read(buffer, size, fh);
+		}
 		else
 			printf("LoadJson: %s failed to load from filesystem (malloc failed), loading hardcoded values\n", filename->c_str());
 	}
@@ -1068,6 +1088,8 @@ LoadDefaultBuf:
 
 SetBuffer:
 	*oriBuf = std::string((char*)buffer, (char*)buffer + size);
+	if (ownsBuffer)
+		free(buffer);
 
 	return 1;
 }
@@ -3007,7 +3029,9 @@ void Hook(HMODULE hEngineModule, HMODULE hFileSystemModule)
 	}
 
 	// create thread to wait for other modules
-	CreateThread(NULL, 0, HookThread, NULL, 0, 0);
+	HANDLE hookThread = CreateThread(NULL, 0, HookThread, NULL, 0, 0);
+	if (hookThread)
+		CloseHandle(hookThread);
 }
 
 void Unhook()

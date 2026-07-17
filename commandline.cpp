@@ -280,4 +280,5 @@ void CCommandLine::CreateCmdLine(const char *commandline)
 	len = strlen(szFull) + 1;
 	m_pszCmdLine = new char [len];
 	memcpy(m_pszCmdLine, szFull, len);
+	delete [] pOrig;
 }
